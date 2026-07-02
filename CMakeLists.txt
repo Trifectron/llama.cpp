@@ -218,6 +218,10 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS AND GGML_RPC)
+    add_subdirectory(prototypes/distributed-rpc)
+endif()
+
 if (LLAMA_BUILD_APP)
     add_subdirectory(app)
 endif()

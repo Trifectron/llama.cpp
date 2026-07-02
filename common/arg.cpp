@@ -2372,8 +2372,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTMD_BATCH_MAX_TOKENS"));
     if (llama_supports_rpc()) {
         add_opt(common_arg(
-            {"--rpc"}, "SERVERS",
-            "comma-separated list of RPC servers (host:port)",
+            {"--rpc", "--distributed"}, "SERVERS",
+            "comma-separated list of RPC servers for distributed inference (host:port)",
             [](common_params & params, const std::string & value) {
                 add_rpc_devices(value);
                 GGML_UNUSED(params);
