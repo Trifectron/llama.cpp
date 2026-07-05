@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package llama_cluster;
+
+// Control-plane protocol for the U-shaped distributed inference cluster (see plan.md).
+// This is deliberately separate from the existing ggml-rpc wire protocol (ggml/src/ggml-rpc),
+// which stays as-is and continues to move tensor/graph data for a single node's local compute.
+// This schema covers cluster membership and inter-node coordination: who is on the network,
+// what are they doing, and handing off a hidden state from one node to the next.
+//
+// Topology: a single coordinator (the host driver, e.g. llama-cluster-ui's role today) tracks
+// membership and issues layer assignments. Once assigned, nodes hand off hidden states to each
+// other directly via PassOff - the coordinator is not in the data path for that hop.
+
+// ---- Coordinator service: every node talks to this one, run by the host ----
+service Coordinator {
+  // One-time join announcement when a node starts up.
+  rpc Hello(HelloRequest) returns (HelloResponse);
+
+  // Periodic liveness + status report. Missing several consecutive heartbeats means the
+  // coordinator presumes the node dead and reassigns its layers.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Graceful departure - lets the coordinator reassign immediately instead of waiting out a
+  // heartbeat timeout.
+  rpc Leave(LeaveRequest) returns (LeaveResponse);
+}
+
+// ---- Node service: every node runs this; the coordinator pushes assignments, peer nodes
+// stream hidden states directly to each other. ----
+service ClusterNode {
+  // Coordinator -> node: "you own layers [layer_start, layer_end) for this request, and when
+  // you're done, hand off to next_node_endpoint (empty if you're the tail)."
+  rpc AssignLayers(AssignLayersRequest) returns (AssignLayersResponse);
+
+  // Node -> node: streams the boundary hidden state directly from the node that just finished
+  // its layer range to the node that owns the next range. Metadata first, then raw tensor bytes
+  // in chunks (kept as a stream rather than one big unary call so this scales to larger
+  // hidden-state tensors without a single oversized message).
+  rpc PassOff(stream PassOffChunk) returns (PassOffAck);
+}
+
+message NodeCapabilities {
+  uint64 total_vram_bytes     = 1;
+  uint64 free_vram_bytes      = 2;
+  string device_name          = 3;  // e.g. "NVIDIA RTX 4090", "CPU"
+  uint32 rpc_protocol_version = 4;  // matches ggml-rpc's RPC_PROTO_MAJOR_VERSION, for a compat check
+  uint32 max_layers           = 5;  // how many transformer layers this node is willing to host
+}
+
+message HelloRequest {
+  string node_id           = 1;  // stable id - e.g. the Tailscale node key, not just an IP
+  string rpc_endpoint       = 2;  // host:port where this node's ggml-rpc-server listens
+  string cluster_node_endpoint = 3; // host:port where this node's ClusterNode service listens
+  NodeCapabilities caps     = 4;
+}
+
+message ClusterMember {
+  string node_id               = 1;
+  string rpc_endpoint           = 2;
+  string cluster_node_endpoint  = 3;
+  NodeCapabilities caps         = 4;
+}
+
+message HelloResponse {
+  bool   accepted       = 1;
+  string reject_reason  = 2;  // set when accepted == false
+  repeated ClusterMember members = 3;  // current cluster view, so the new node isn't blind until the next heartbeat round
+}
+
+message HeartbeatRequest {
+  string node_id            = 1;
+  uint64 free_vram_bytes     = 2;
+  bool   busy                = 3;
+  string current_request_id  = 4;  // empty if idle
+  uint32 layer_start         = 5;  // current assignment, if any (ignored if current_request_id is empty)
+  uint32 layer_end           = 6;
+  uint32 queue_depth         = 7;  // requests waiting behind the current one
+}
+
+message HeartbeatResponse {
+  bool ack = 1;
+}
+
+message LeaveRequest {
+  string node_id = 1;
+  string reason   = 2;  // "shutdown", "user requested", etc - informational only
+}
+
+message LeaveResponse {
+  bool ack = 1;
+}
+
+message AssignLayersRequest {
+  string request_id         = 1;
+  string model_path         = 2;  // or a content hash, so the node loads the exact same weights
+  uint32 layer_start         = 3;
+  uint32 layer_end           = 4;
+  string next_node_endpoint  = 5;  // ClusterNode endpoint to PassOff to; empty = this node is the tail
+}
+
+message AssignLayersResponse {
+  bool   accepted       = 1;
+  string reject_reason  = 2;  // e.g. "model not found", "out of memory", "already busy"
+}
+
+message TensorMeta {
+  string request_id      = 1;
+  uint32 layer_boundary   = 2;  // the layer index this hidden state was captured at
+  uint32 n_tokens         = 3;
+  uint32 n_embd           = 4;
+  string dtype            = 5;  // "f32" for now; revisit if hidden states are ever quantized in transit
+  repeated int32 positions = 6; // sequence positions, so the receiving node's RoPE stays correct
+}
+
+message PassOffChunk {
+  oneof payload {
+    TensorMeta meta = 1;  // always the first message in the stream
+    bytes      data = 2;  // raw tensor bytes, chunked
+  }
+}
+
+message PassOffAck {
+  bool   ok    = 1;
+  string error = 2;
+}

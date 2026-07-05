@@ -20,6 +20,12 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // [EXPERIMENTAL] bound the transformer layer loop to [il_start, il_end) for split-inference
+    // prototypes (head/tail contexts that hand off a hidden state at a layer boundary instead of
+    // running the full model). il_end == -1 means "all layers" (n_layer()), the default.
+    int32_t  il_start = 0;
+    int32_t  il_end   = -1;
+
     float rope_freq_base;
     float rope_freq_scale;
 

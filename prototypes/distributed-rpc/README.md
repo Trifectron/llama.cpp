@@ -77,42 +77,35 @@ Use `HOST=127.0.0.1` when testing through SSH tunnels.
 
 ## Run From The Host
 
-With a local GGUF:
-
-```sh
-RPC_SERVERS=192.168.1.20:50052,192.168.1.21:50052 \
-MODEL=/models/model.gguf \
-./prototypes/distributed-rpc/host-run.sh
-```
-
-With Hugging Face download support:
-
-```sh
-RPC_SERVERS=192.168.1.20:50052 \
-HF_REPO=ggml-org/gemma-3-1b-it-GGUF:Q4_K_M \
-./prototypes/distributed-rpc/host-run.sh
-```
-
-Useful knobs:
-
-```sh
-N_GPU_LAYERS=all       # default
-TENSOR_SPLIT=1,1       # split proportions across visible RPC/local devices
-CTX_SIZE=4096
-PROMPT="Write one paragraph about distributed inference."
-```
-
-The wrapper expands `RPC_SERVERS` to `llama-cli --distributed ...`. You can use
-that option directly too:
+There is no shell wrapper for this - `llama-cli` supports `--distributed`/`--rpc` natively,
+including Tailscale auto-discovery (`auto`), so invoke it directly:
 
 ```sh
 build-rpc/bin/llama-cli \
-  --distributed 192.168.1.20:50052 \
+  --distributed 192.168.1.20:50052,192.168.1.21:50052 \
   --split-mode layer \
   --n-gpu-layers all \
   --model /models/model.gguf \
-  "Hello from distributed llama.cpp."
+  --prompt "Hello from distributed llama.cpp."
 ```
+
+Or let it discover nodes on your Tailscale tailnet itself instead of listing them by hand
+(requires nodes already running `remote-node.sh`, and `tailscale` in `PATH`):
+
+```sh
+build-rpc/bin/llama-cli \
+  --distributed auto \
+  --split-mode layer \
+  --n-gpu-layers all \
+  --model /models/model.gguf \
+  --prompt "Hello from distributed llama.cpp."
+```
+
+`TAILSCALE_RPC_PORT` (default 50052) and `TAILSCALE_CONNECT_TIMEOUT_MS` (default 500) tune the
+discovery probe. See `--help` for `--tensor-split`, `--ctx-size`, and other flags.
+
+For a browser-based control panel instead (discover nodes, pick a model, set node order, launch,
+watch streamed output), see `llama-cluster-ui` below.
 
 ## C-Side GGML Tap
 
@@ -146,10 +139,11 @@ For a first performance pass, compare:
 
 ```sh
 # Local only
-MODEL=/models/model.gguf RPC_SERVERS= ./prototypes/distributed-rpc/host-run.sh
+build-rpc/bin/llama-cli --model /models/model.gguf --prompt "..."
 
 # Remote split
-MODEL=/models/model.gguf RPC_SERVERS=192.168.1.20:50052 ./prototypes/distributed-rpc/host-run.sh
+build-rpc/bin/llama-cli --distributed 192.168.1.20:50052 --split-mode layer \
+  --n-gpu-layers all --model /models/model.gguf --prompt "..."
 ```
 
 Track prompt processing tokens/sec, generation tokens/sec, and wall-clock time.

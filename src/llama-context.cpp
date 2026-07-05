@@ -77,6 +77,13 @@ llama_context::llama_context(
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
 
+    cparams.il_start = params.il_start;
+    cparams.il_end   = params.il_end < 0 ? (int32_t) hparams.n_layer() : params.il_end;
+
+    if (cparams.il_start < 0 || cparams.il_start > cparams.il_end || cparams.il_end > (int32_t) hparams.n_layer()) {
+        throw std::runtime_error("invalid il_start/il_end range for split-inference context");
+    }
+
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
@@ -3486,6 +3493,8 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.il_start                    =*/ 0,
+        /*.il_end                      =*/ -1,
     };
 
     return result;

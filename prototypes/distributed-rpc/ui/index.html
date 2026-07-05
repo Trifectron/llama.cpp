@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llama-cluster-ui — distributed-rpc control panel</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2029;
+    --panel2: #232b36;
+    --ink: #d7dee8;
+    --muted: #8a97a8;
+    --accent: #6ab7ff;
+    --line: #2c3541;
+    --code-bg: #11161d;
+    --err: #ff6b6b;
+    --ok: #57d38c;
+    --mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 32px 24px 96px; }
+  header h1 { font-size: 24px; margin: 0 0 6px; }
+  header p.sub { color: var(--muted); margin: 0 0 8px; }
+  h2 { font-size: 18px; margin: 32px 0 10px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; margin: 14px 0; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+  input, select, textarea, button {
+    background: var(--panel2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 9px; font: inherit; font-size: 13px;
+  }
+  textarea { width: 100%; resize: vertical; font-family: var(--mono); }
+  input[type=number] { width: 90px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #0f1419; border-color: var(--accent); font-weight: 600; }
+  button.danger:hover { border-color: var(--err); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+
+  table.dev { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  table.dev th, table.dev td { text-align: left; padding: 6px 8px; font-size: 13px; border-bottom: 1px solid var(--line); }
+  table.dev th { color: var(--muted); font-weight: 500; }
+  .tag { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 10px; background: #1e2c3a; color: var(--accent); }
+  .ord button { padding: 2px 7px; font-size: 12px; }
+  .muted { color: var(--muted); }
+  .status { font-family: var(--mono); font-size: 13px; }
+  .status.ok { color: var(--ok); }
+  .status.err { color: var(--err); }
+
+  .bar { display: flex; height: 40px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); margin: 10px 0; }
+  .seg { display: flex; align-items: center; justify-content: center; color: #0f1419; font-family: var(--mono); font-size: 11px; overflow: hidden; white-space: nowrap; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: baseline; }
+
+  .out {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 14px; font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap;
+    word-break: break-all; max-height: 360px; overflow-y: auto; margin-top: 10px;
+  }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .grow { flex: 1; min-width: 200px; }
+  footer { color: var(--muted); font-size: 12.5px; margin-top: 40px; border-top: 1px solid var(--line); padding-top: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>llama-cluster-ui</h1>
+  <p class="sub">Discover Tailscale peers running <code>ggml-rpc-server</code>, pick a model and
+  node order, and launch <code>llama-cli --distributed</code> directly - no shell wrapper.</p>
+</header>
+
+<h2>1. Nodes</h2>
+<div class="panel">
+  <div class="row">
+    <button id="btnDiscover">Discover nodes</button>
+    <span id="discoverStatus" class="status muted"></span>
+  </div>
+  <table class="dev" id="devTable" style="display:none">
+    <thead><tr><th style="width:44px"></th><th>Order</th><th>Host</th><th>Endpoint</th><th>Free / Total VRAM</th></tr></thead>
+    <tbody id="devBody"></tbody>
+  </table>
+  <div id="devEmpty" class="muted" style="margin-top:8px">No nodes discovered yet. This machine will run the whole model locally if you launch without any.</div>
+</div>
+
+<h2>2. Model</h2>
+<div class="panel">
+  <div class="row">
+    <select id="modelSelect" class="grow"><option value="">(loading models...)</option></select>
+    <button id="btnRefreshModels">Refresh</button>
+  </div>
+  <div id="splitPreview"></div>
+</div>
+
+<h2>3. Prompt</h2>
+<div class="panel">
+  <label>Prompt</label>
+  <textarea id="prompt" rows="3">Hello from the llama-cluster-ui control panel.</textarea>
+  <label>Tokens to generate</label>
+  <input type="number" id="nPredict" value="32" min="1" max="4096">
+</div>
+
+<h2>4. Run</h2>
+<div class="panel">
+  <div class="row">
+    <button id="btnLaunch" class="primary">Launch</button>
+    <button id="btnStop" class="danger" disabled>Stop</button>
+    <span id="runStatus" class="status muted"></span>
+  </div>
+  <div id="output" class="out" style="display:none"></div>
+</div>
+
+<footer>
+  llama-cluster-ui - part of the distributed-rpc prototype. Binds to 127.0.0.1 by default; do
+  not expose this to an untrusted network - it can launch processes with no authentication.
+</footer>
+
+</div>
+
+<script>
+"use strict";
+
+const COLORS = ["#6ab7ff","#c792ea","#f6c177","#57d38c","#ff9e9e","#7fd6c4","#e0a3ff","#b7c46a"];
+const GIB = 2 ** 30;
+const $ = id => document.getElementById(id);
+
+let nodes = [];       // [{hostname, ip, port, endpoint, free_bytes, total_bytes}]
+let models = [];      // [{name, path, arch, n_layers, size_bytes}]
+let currentRunId = null;
+let pollTimer = null;
+
+// ---- discovery ----
+async function discover() {
+  $("discoverStatus").textContent = "discovering...";
+  $("discoverStatus").className = "status muted";
+  try {
+    const res = await fetch("/api/discover");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    nodes = await res.json();
+    renderNodes();
+    $("discoverStatus").textContent = nodes.length
+      ? `${nodes.length} node(s) confirmed running ggml-rpc-server`
+      : "no nodes found on the tailnet";
+    $("discoverStatus").className = "status " + (nodes.length ? "ok" : "muted");
+  } catch (e) {
+    $("discoverStatus").textContent = "discovery failed: " + e.message;
+    $("discoverStatus").className = "status err";
+  }
+  renderSplitPreview();
+}
+
+function renderNodes() {
+  const table = $("devTable");
+  const empty = $("devEmpty");
+  const body = $("devBody");
+  body.innerHTML = "";
+
+  if (nodes.length === 0) {
+    table.style.display = "none";
+    empty.style.display = "block";
+    return;
+  }
+  table.style.display = "table";
+  empty.style.display = "none";
+
+  nodes.forEach((n, i) => {
+    const tr = document.createElement("tr");
+    const freeGiB = (n.free_bytes / GIB).toFixed(1);
+    const totalGiB = (n.total_bytes / GIB).toFixed(1);
+
+    tr.innerHTML = `
+      <td><span class="swatch" style="background:${COLORS[i % COLORS.length]}"></span></td>
+      <td class="ord">
+        <button data-dir="up" data-i="${i}" ${i === 0 ? "disabled" : ""}>&uarr;</button>
+        <button data-dir="down" data-i="${i}" ${i === nodes.length - 1 ? "disabled" : ""}>&darr;</button>
+      </td>
+      <td>${n.hostname}</td>
+      <td style="font-family:var(--mono)">${n.endpoint}</td>
+      <td style="font-family:var(--mono)">${freeGiB} / ${totalGiB} GiB</td>
+    `;
+    body.appendChild(tr);
+  });
+
+  body.querySelectorAll("button[data-dir]").forEach(btn => {
+    btn.onclick = () => {
+      const i = parseInt(btn.dataset.i, 10);
+      const j = btn.dataset.dir === "up" ? i - 1 : i + 1;
+      [nodes[i], nodes[j]] = [nodes[j], nodes[i]];
+      renderNodes();
+      renderSplitPreview();
+    };
+  });
+}
+
+// ---- models ----
+async function loadModels() {
+  const sel = $("modelSelect");
+  sel.innerHTML = `<option value="">(loading models...)</option>`;
+  try {
+    const res = await fetch("/api/models");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    models = await res.json();
+    if (models.length === 0) {
+      sel.innerHTML = `<option value="">(no .gguf files found - set MODELS_DIR)</option>`;
+      return;
+    }
+    sel.innerHTML = models.map(m =>
+      `<option value="${m.path}">${m.name}${m.n_layers ? ` (${m.n_layers} layers, ${(m.size_bytes / GIB).toFixed(2)} GiB)` : ""}</option>`
+    ).join("");
+  } catch (e) {
+    sel.innerHTML = `<option value="">(failed to load models: ${e.message})</option>`;
+  }
+  renderSplitPreview();
+}
+
+function selectedModel() {
+  const path = $("modelSelect").value;
+  return models.find(m => m.path === path) || null;
+}
+
+// ---- illustrative layer-split preview (client-side only, does not affect the actual launch -
+// llama-cli's own --split-mode layer bucketing decides the real split) ----
+function renderSplitPreview() {
+  const box = $("splitPreview");
+  const model = selectedModel();
+  if (!model || !model.n_layers || nodes.length === 0) {
+    box.innerHTML = "";
+    return;
+  }
+
+  const usable = nodes.map(n => Math.max(n.free_bytes, 1));
+  const total = usable.reduce((a, b) => a + b, 0);
+  const quotas = usable.map(u => u / total * model.n_layers);
+  const counts = quotas.map(q => Math.floor(q));
+  const need = model.n_layers - counts.reduce((a, b) => a + b, 0);
+  const order = quotas.map((q, i) => i).sort((a, b) => (quotas[b] - counts[b]) - (quotas[a] - counts[a]));
+  for (let k = 0; k < need; k++) counts[order[k]] += 1;
+
+  const bar = counts.map((c, i) => {
+    if (c === 0) return "";
+    const pct = (c / model.n_layers) * 100;
+    return `<div class="seg" style="width:${pct}%;background:${COLORS[i % COLORS.length]}" title="${nodes[i].hostname}: ${c} layers">${c}</div>`;
+  }).join("");
+
+  box.innerHTML = `<div class="muted" style="font-size:12px;margin-top:10px">illustrative layer split preview (proportional to free VRAM) - the real split is decided by llama-cli itself</div><div class="bar">${bar}</div>`;
+}
+
+// ---- launch / poll / stop ----
+async function launch() {
+  const model = selectedModel();
+  if (!model) {
+    $("runStatus").textContent = "pick a model first";
+    $("runStatus").className = "status err";
+    return;
+  }
+
+  $("btnLaunch").disabled = true;
+  $("runStatus").textContent = "launching...";
+  $("runStatus").className = "status muted";
+  $("output").style.display = "block";
+  $("output").textContent = "";
+
+  try {
+    const res = await fetch("/api/launch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model_path: model.path,
+        prompt: $("prompt").value,
+        n_predict: parseInt($("nPredict").value, 10) || 32,
+        nodes: nodes.map(n => ({ endpoint: n.endpoint })),
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+
+    currentRunId = data.run_id;
+    $("btnStop").disabled = false;
+    $("runStatus").textContent = "running (run " + currentRunId + ")";
+    $("runStatus").className = "status ok";
+    poll();
+  } catch (e) {
+    $("runStatus").textContent = "launch failed: " + e.message;
+    $("runStatus").className = "status err";
+    $("btnLaunch").disabled = false;
+  }
+}
+
+async function poll() {
+  if (!currentRunId) return;
+  try {
+    const res = await fetch(`/api/runs/${currentRunId}`);
+    const data = await res.json();
+    $("output").textContent = data.output;
+    $("output").scrollTop = $("output").scrollHeight;
+
+    if (data.running) {
+      pollTimer = setTimeout(poll, 1000);
+    } else {
+      $("runStatus").textContent = `finished (exit code ${data.exit_code})`;
+      $("runStatus").className = "status " + (data.exit_code === 0 ? "ok" : "err");
+      $("btnLaunch").disabled = false;
+      $("btnStop").disabled = true;
+    }
+  } catch (e) {
+    $("runStatus").textContent = "poll failed: " + e.message;
+    $("runStatus").className = "status err";
+  }
+}
+
+async function stop() {
+  if (!currentRunId) return;
+  await fetch(`/api/runs/${currentRunId}/stop`, { method: "POST" });
+  $("btnStop").disabled = true;
+}
+
+$("btnDiscover").onclick = discover;
+$("btnRefreshModels").onclick = loadModels;
+$("btnLaunch").onclick = launch;
+$("btnStop").onclick = stop;
+$("modelSelect").onchange = renderSplitPreview;
+
+loadModels();
+</script>
+</body>
+</html>

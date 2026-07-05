@@ -35,6 +35,15 @@
 #include <thread> // for hardware_concurrency
 #include <vector>
 
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #ifndef __EMSCRIPTEN__
 #ifdef __linux__
 #include <linux/limits.h>
@@ -933,7 +942,172 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
     return devices;
 }
 
-static void add_rpc_devices(const std::string & servers) {
+#ifndef _WIN32
+// Fast pre-filter for tailscale_discover_rpc_servers(): is anything listening on ip:port at
+// all? Avoids paying the RPC handshake's own (unbounded) wait for peers that are online in
+// Tailscale but simply don't have a ggml-rpc-server running.
+static bool tcp_port_open(const std::string & ip, int port, int timeout_ms) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+
+    const int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t) port);
+    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+        close(fd);
+        return false;
+    }
+
+    bool ok = false;
+    const int rc = connect(fd, (struct sockaddr *) &addr, sizeof(addr));
+    if (rc == 0) {
+        ok = true;
+    } else if (errno == EINPROGRESS) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+
+        struct timeval tv;
+        tv.tv_sec  = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+        if (select(fd + 1, NULL, &wfds, NULL, &tv) > 0) {
+            int       err     = 0;
+            socklen_t err_len = sizeof(err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len) == 0 && err == 0) {
+                ok = true;
+            }
+        }
+    }
+
+    close(fd);
+    return ok;
+}
+#endif // _WIN32
+
+// Resolves "auto" for --rpc/--distributed: asks the local Tailscale daemon which peers are
+// online, then confirms each one is actually running a ggml-rpc-server (a real RPC_CMD_HELLO
+// handshake via ggml_backend_rpc_get_device_memory(), not just an open port) before including
+// it. Returns a comma-separated host:port list (possibly empty). Port/timeout come from the
+// TAILSCALE_RPC_PORT / TAILSCALE_CONNECT_TIMEOUT_MS env vars, matching the standalone
+// prototypes/distributed-rpc/llama-tailscale-discover tool this mirrors.
+//
+// [EXPERIMENTAL] this shells out to the `tailscale` CLI and does its own TCP probing, which is a
+// different pattern from the rest of this file - flagged here rather than hidden.
+static std::string tailscale_discover_rpc_servers() {
+#ifdef _WIN32
+    throw std::invalid_argument("--rpc auto (Tailscale discovery) is not supported on Windows yet");
+#else
+    const char * env_port    = getenv("TAILSCALE_RPC_PORT");
+    const char * env_timeout = getenv("TAILSCALE_CONNECT_TIMEOUT_MS");
+    const int    port        = env_port    ? atoi(env_port)    : 50052;
+    const int    timeout_ms  = env_timeout ? atoi(env_timeout) : 500;
+
+    FILE * pipe = popen("tailscale status --json 2>/dev/null", "r");
+    if (pipe == NULL) {
+        throw std::invalid_argument("failed to run 'tailscale status --json' (is tailscale installed and in PATH?)");
+    }
+
+    std::string output;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0) {
+        output.append(buf, n);
+    }
+    const int rc = pclose(pipe);
+    if (rc != 0 || output.empty()) {
+        throw std::invalid_argument("'tailscale status --json' failed (is the tailscaled daemon running and are you logged in?)");
+    }
+
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(output);
+    } catch (const nlohmann::json::exception & e) {
+        throw std::invalid_argument(string_format("failed to parse tailscale status JSON: %s", e.what()));
+    }
+
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        throw std::invalid_argument("failed to find RPC backend");
+    }
+    typedef void (*ggml_backend_rpc_get_device_memory_t)(const char * endpoint, uint32_t device, size_t * free, size_t * total);
+    auto get_device_memory_fn = (ggml_backend_rpc_get_device_memory_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_get_device_memory");
+    if (!get_device_memory_fn) {
+        throw std::invalid_argument("failed to find RPC get-device-memory function");
+    }
+
+    std::vector<std::string> confirmed;
+
+    if (j.contains("Peer") && j["Peer"].is_object()) {
+        for (const auto & [node_id, peer] : j["Peer"].items()) {
+            GGML_UNUSED(node_id);
+
+            if (!peer.value("Online", false)) {
+                continue;
+            }
+            if (!peer.contains("TailscaleIPs") || !peer["TailscaleIPs"].is_array() || peer["TailscaleIPs"].empty()) {
+                continue;
+            }
+
+            const std::string hostname = peer.value("HostName", "(unknown)");
+            const std::string ip       = peer["TailscaleIPs"][0].get<std::string>();
+
+            if (!tcp_port_open(ip, port, timeout_ms)) {
+                LOG_INF("%s: tailnet peer %s (%s) port %d closed/unreachable - skipped\n", __func__, hostname.c_str(), ip.c_str(), port);
+                continue;
+            }
+
+            const std::string endpoint = ip + ":" + std::to_string(port);
+
+            // NOTE: unlike tcp_port_open() above, this handshake has no timeout of its own - if
+            // something other than ggml-rpc-server is listening on this port and never responds
+            // or disconnects, this call can block indefinitely. Acceptable for discovery over a
+            // small, trusted tailnet.
+            size_t free_mem  = 0;
+            size_t total_mem = 0;
+            get_device_memory_fn(endpoint.c_str(), 0, &free_mem, &total_mem);
+
+            if (total_mem == 0) {
+                LOG_INF("%s: tailnet peer %s (%s) port open but not a ggml-rpc-server - skipped\n", __func__, hostname.c_str(), ip.c_str());
+                continue;
+            }
+
+            LOG_INF("%s: tailnet peer %s (%s) confirmed ggml-rpc-server, free=%.1f MiB total=%.1f MiB\n",
+                    __func__, hostname.c_str(), ip.c_str(), free_mem / 1024.0 / 1024.0, total_mem / 1024.0 / 1024.0);
+
+            confirmed.push_back(endpoint);
+        }
+    }
+
+    std::string joined;
+    for (size_t i = 0; i < confirmed.size(); ++i) {
+        if (i > 0) {
+            joined += ",";
+        }
+        joined += confirmed[i];
+    }
+
+    return joined;
+#endif // _WIN32
+}
+
+static void add_rpc_devices(const std::string & servers_in) {
+    std::string servers = servers_in;
+    if (servers == "auto") {
+        servers = tailscale_discover_rpc_servers();
+        if (servers.empty()) {
+            throw std::invalid_argument("Tailscale discovery found no ggml-rpc-server nodes on the tailnet");
+        }
+        LOG_INF("%s: discovered RPC servers via Tailscale: %s\n", __func__, servers.c_str());
+    }
+
     auto rpc_servers = string_split<std::string>(servers, ',');
     if (rpc_servers.empty()) {
         throw std::invalid_argument("no RPC servers specified");
@@ -2373,7 +2547,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     if (llama_supports_rpc()) {
         add_opt(common_arg(
             {"--rpc", "--distributed"}, "SERVERS",
-            "comma-separated list of RPC servers for distributed inference (host:port)",
+            "comma-separated list of RPC servers for distributed inference (host:port), "
+            "or \"auto\" to discover them from the local Tailscale tailnet [EXPERIMENTAL]",
             [](common_params & params, const std::string & value) {
                 add_rpc_devices(value);
                 GGML_UNUSED(params);
