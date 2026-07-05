@@ -3,9 +3,15 @@
 // peers running ggml-rpc-server, lists local GGUF models, and launches llama-cli directly - no
 // shell script in between (host-run.sh was removed; this replaces its one job).
 //
-// Deliberately does not link ggml/llama - it has no need to load a model or speak RPC itself,
-// it only orchestrates two other binaries in this same directory (llama-tailscale-discover,
-// llama-cli) as subprocesses, the same way a human operator would from a terminal.
+// This is the single, self-contained entry point for the whole cluster workflow: discovery is
+// in-process (via the shared tailscale_discovery module - the exact same logic
+// llama-tailscale-discover's standalone CLI uses, not a subprocess call to it), and launching is
+// a direct fork()+execve() of llama-cli. The only other binary this ever shells out to is
+// llama-cli itself, to actually run inference.
+
+#include "tailscale_discovery.h"
+
+#include "ggml-backend.h"
 
 #include <cpp-httplib/httplib.h>
 #include <nlohmann/json.hpp>
@@ -285,7 +291,14 @@ int main(int argc, char ** argv) {
     }
 
     const std::string llama_cli_path = sibling_binary_path(argv[0], "llama-cli");
-    const std::string discover_path  = sibling_binary_path(argv[0], "llama-tailscale-discover");
+
+    const char * env_ts_port    = getenv("TAILSCALE_RPC_PORT");
+    const char * env_ts_timeout = getenv("TAILSCALE_CONNECT_TIMEOUT_MS");
+    const int    ts_port        = env_ts_port    ? atoi(env_ts_port)    : 50052;
+    const int    ts_timeout_ms  = env_ts_timeout ? atoi(env_ts_timeout) : 500;
+
+    // one-time backend registry scan, needed by tailscale_discover_nodes()'s RPC handshake step.
+    ggml_backend_load_all();
 
     httplib::Server svr;
 
@@ -293,25 +306,27 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "warning: static UI directory not found: %s (GET / will 404)\n", static_dir.c_str());
     }
 
-    svr.Get("/api/discover", [discover_path](const httplib::Request &, httplib::Response & res) {
-        FILE * pipe = popen((discover_path + " --json 2>/dev/null").c_str(), "r");
-        if (!pipe) {
+    svr.Get("/api/discover", [ts_port, ts_timeout_ms](const httplib::Request &, httplib::Response & res) {
+        std::vector<discovered_node> found;
+        std::string                  error;
+        if (!tailscale_discover_nodes(ts_port, ts_timeout_ms, found, error)) {
             res.status = 500;
-            res.set_content(R"({"error":"failed to run llama-tailscale-discover"})", "application/json");
+            res.set_content(json{{"error", error}}.dump(), "application/json");
             return;
         }
-        std::string output;
-        char buf[4096];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0) {
-            output.append(buf, n);
-        }
-        pclose(pipe);
 
-        if (output.empty()) {
-            output = "[]";
+        json arr = json::array();
+        for (const auto & node : found) {
+            arr.push_back({
+                {"hostname",    node.hostname},
+                {"ip",          node.ip},
+                {"port",        node.port},
+                {"endpoint",    node.endpoint},
+                {"free_bytes",  node.free_bytes},
+                {"total_bytes", node.total_bytes},
+            });
         }
-        res.set_content(output, "application/json");
+        res.set_content(arr.dump(), "application/json");
     });
 
     svr.Get("/api/models", [models_dir](const httplib::Request &, httplib::Response & res) {
@@ -446,7 +461,7 @@ int main(int argc, char ** argv) {
     });
 
     fprintf(stderr, "[cluster-ui] llama-cli:      %s\n", llama_cli_path.c_str());
-    fprintf(stderr, "[cluster-ui] discover:       %s\n", discover_path.c_str());
+    fprintf(stderr, "[cluster-ui] discover:       in-process (port %d, timeout %d ms)\n", ts_port, ts_timeout_ms);
     fprintf(stderr, "[cluster-ui] models dir:     %s\n", models_dir.c_str());
     fprintf(stderr, "[cluster-ui] static dir:     %s\n", static_dir.c_str());
     fprintf(stderr, "[cluster-ui] listening on http://%s:%d\n", host.c_str(), port);
