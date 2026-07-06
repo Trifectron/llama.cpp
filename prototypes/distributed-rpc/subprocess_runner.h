@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct run_state {
@@ -49,4 +50,11 @@ std::string sibling_binary_path(const char * self_argv0, const char * name);
 // the returned run_state's output buffer (accumulated on a background thread) and stdin from
 // the null device (the child never has a terminal to block on). Returns immediately; poll
 // run_state::running/exit_code to observe completion.
-std::shared_ptr<run_state> launch_process(const std::vector<std::string> & argv_strs);
+//
+// env_overrides: {name, value} pairs added to (or replacing, by name) this process's own
+// environment for the child only - built into a fresh envp/environment-block passed directly to
+// execve()/CreateProcessA(), never by mutating this process's global environment (setenv() would
+// race against launch_process() being called concurrently from multiple request-handler
+// threads, which it is).
+std::shared_ptr<run_state> launch_process(const std::vector<std::string> & argv_strs,
+                                            const std::vector<std::pair<std::string, std::string>> & env_overrides = {});

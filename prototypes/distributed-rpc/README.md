@@ -153,9 +153,10 @@ From there you can:
   ggml-rpc-server (their own `llama-cluster-ui`'s embedded server, or a standalone
   `ggml-rpc-server`/`remote-node.sh` - both look identical to discovery), and lets you reorder
   them (pipeline/layer order).
-- **Pick or download a model** - lists local `.gguf` files under `MODELS_DIR`, or download one
-  directly from Hugging Face (`llama download -hf <repo>[:tag]` under the hood) with a live
-  progress panel.
+- **Pick or download a model** - lists local `.gguf` files under `MODELS_DIR` (scanned
+  recursively, so a downloaded model's nested Hugging Face cache layout is found too - see
+  below), or download one directly from Hugging Face (`llama download -hf <repo>[:tag]` under
+  the hood) with a live progress panel.
 - **Launch** - runs `llama-cli --distributed <endpoints> --split-mode layer` with the chosen
   model/prompt, and streams its output back to the page. **Stop** terminates the run.
 
@@ -165,10 +166,20 @@ Env vars (all optional, sane defaults):
 CLUSTER_UI_HOST=127.0.0.1     # UI bind address - loopback by default, unlike RPC_SERVE_HOST
 CLUSTER_UI_PORT=8787
 MODELS_DIR=prototypes/distributed-rpc/testdata
+CLUSTER_DOWNLOAD_DIR=$MODELS_DIR   # default - see below
 CLUSTER_UI_STATIC_DIR=prototypes/distributed-rpc/ui
 TAILSCALE_RPC_PORT=50052
 TAILSCALE_CONNECT_TIMEOUT_MS=500
 ```
+
+`CLUSTER_DOWNLOAD_DIR` is per-node, local config only - each machine decides for itself where
+its own downloads land (there is no field on the cluster gRPC protocol's `DownloadModel` RPC to
+override this remotely). It defaults to `MODELS_DIR`'s value, so anything downloaded - whether
+via the HTTP download panel or a remote `DownloadModel` gRPC call from another node - immediately
+shows up in this same node's own model list without extra config. It's passed as an `LLAMA_CACHE`
+override to the `llama download` subprocess's own environment only (never this process's global
+environment), so it doesn't affect any other tool's caching. Point it elsewhere if you'd rather
+keep downloaded models separate from `MODELS_DIR`'s manually-placed ones.
 
 The UI's own HTTP server defaults to loopback-only (`127.0.0.1`) since it can launch arbitrary
 `llama-cli` invocations with no authentication - unlike the embedded RPC server half

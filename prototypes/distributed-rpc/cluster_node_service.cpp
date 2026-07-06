@@ -116,7 +116,11 @@ grpc::Status cluster_node_service::DownloadModel(grpc::ServerContext *, const ll
         argv_strs.push_back(request->hf_file());
     }
 
-    auto state = launch_process(argv_strs);
+    std::vector<std::pair<std::string, std::string>> env_overrides;
+    if (!download_dir_.empty()) {
+        env_overrides.push_back({"LLAMA_CACHE", download_dir_});
+    }
+    auto state = launch_process(argv_strs, env_overrides);
 
     std::string download_id;
     {

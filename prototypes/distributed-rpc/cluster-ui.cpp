@@ -184,6 +184,44 @@ static bool read_gguf_meta(const std::string & path, gguf_meta & out) {
     return false;
 }
 
+// Recursively scans a directory tree for *.gguf files, depth-bounded (defensive against
+// pathological nesting/symlink cycles rather than genuinely expected). A flat, single-level scan
+// alone would never find a model placed by CLUSTER_DOWNLOAD_DIR/DownloadModel: Hugging Face's
+// own cache layout nests several directories deep
+// (models--org--repo/snapshots/<sha>/file.gguf, itself a symlink to .../blobs/<oid> - stat()
+// follows the symlink transparently, so it's reported as a regular file here).
+static void scan_gguf_files_recursive(const std::string & dir_path, int depth_remaining, std::vector<std::string> & out_paths) {
+    if (depth_remaining <= 0) {
+        return;
+    }
+
+    DIR * dir = opendir(dir_path.c_str());
+    if (!dir) {
+        return;
+    }
+
+    struct dirent * entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        const std::string name(entry->d_name);
+        if (name == "." || name == "..") {
+            continue;
+        }
+        const std::string path = dir_path + "/" + name;
+
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) {
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            scan_gguf_files_recursive(path, depth_remaining - 1, out_paths);
+        } else if (S_ISREG(st.st_mode) && name.size() > 5 && name.compare(name.size() - 5, 5, ".gguf") == 0) {
+            out_paths.push_back(path);
+        }
+    }
+    closedir(dir);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Subprocess launching (run_state, launch_process(), sibling_binary_path()) now lives in
 // subprocess_runner.h/.cpp - shared with cluster_node_service.cpp's DownloadModel gRPC handler,
@@ -374,15 +412,24 @@ static bool start_cluster_grpc_server(const std::string & host, int port) {
 // ---------------------------------------------------------------------------------------------
 
 int main(int argc, char ** argv) {
-    const char * env_host       = getenv("CLUSTER_UI_HOST");
-    const char * env_port       = getenv("CLUSTER_UI_PORT");
-    const char * env_models_dir = getenv("MODELS_DIR");
-    const char * env_static_dir = getenv("CLUSTER_UI_STATIC_DIR");
+    const char * env_host        = getenv("CLUSTER_UI_HOST");
+    const char * env_port        = getenv("CLUSTER_UI_PORT");
+    const char * env_models_dir  = getenv("MODELS_DIR");
+    const char * env_static_dir  = getenv("CLUSTER_UI_STATIC_DIR");
+    const char * env_download_dir = getenv("CLUSTER_DOWNLOAD_DIR");
 
     const std::string host       = env_host       ? env_host       : "127.0.0.1";
     const int          port      = env_port       ? atoi(env_port) : 8787;
     const std::string models_dir = env_models_dir ? env_models_dir : "prototypes/distributed-rpc/testdata";
     const std::string static_dir = env_static_dir ? env_static_dir : "prototypes/distributed-rpc/ui";
+
+    // Per-node download destination: each machine decides for itself (no field on the gRPC
+    // DownloadModelRequest to override this remotely) - defaults to MODELS_DIR itself, so a
+    // download immediately shows up in this same node's own /api/models scan (which is
+    // recursive - see below) without any extra config. Passed as an LLAMA_CACHE override to the
+    // `llama download` subprocess's environment specifically, never by mutating this process's
+    // own environment - see subprocess_runner.h's env_overrides parameter.
+    const std::string download_dir = env_download_dir ? env_download_dir : models_dir;
 
     if (host != "127.0.0.1" && host != "localhost" && host != "::1") {
         fprintf(stderr,
@@ -402,6 +449,7 @@ int main(int argc, char ** argv) {
     // lets the ClusterNode service's DownloadModel gRPC handler launch the same subprocess
     // /api/models/download uses over HTTP, on this node instead of just the origin's own.
     g_cluster_node.set_download_binary_path(llama_download_path);
+    g_cluster_node.set_download_dir(download_dir);
 
     const char * env_ts_port    = getenv("TAILSCALE_RPC_PORT");
     const char * env_ts_timeout = getenv("TAILSCALE_CONNECT_TIMEOUT_MS");
@@ -482,25 +530,21 @@ int main(int argc, char ** argv) {
     svr.Get("/api/models", [models_dir](const httplib::Request &, httplib::Response & res) {
         json arr = json::array();
 
-        DIR * dir = opendir(models_dir.c_str());
-        if (dir) {
-            struct dirent * entry;
-            while ((entry = readdir(dir)) != nullptr) {
-                const std::string name(entry->d_name);
-                if (name.size() < 5 || name.compare(name.size() - 5, 5, ".gguf") != 0) {
-                    continue;
-                }
-                const std::string path = models_dir + "/" + name;
-                gguf_meta meta;
-                json entry_json = {{"name", name}, {"path", path}};
-                if (read_gguf_meta(path, meta)) {
-                    entry_json["arch"]        = meta.arch;
-                    entry_json["n_layers"]    = meta.n_layers;
-                    entry_json["size_bytes"]  = meta.size_bytes;
-                }
-                arr.push_back(entry_json);
+        std::vector<std::string> gguf_paths;
+        scan_gguf_files_recursive(models_dir, /*depth_remaining=*/6, gguf_paths);
+
+        for (const auto & path : gguf_paths) {
+            const size_t slash = path.find_last_of('/');
+            const std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+
+            gguf_meta meta;
+            json entry_json = {{"name", name}, {"path", path}};
+            if (read_gguf_meta(path, meta)) {
+                entry_json["arch"]       = meta.arch;
+                entry_json["n_layers"]   = meta.n_layers;
+                entry_json["size_bytes"] = meta.size_bytes;
             }
-            closedir(dir);
+            arr.push_back(entry_json);
         }
 
         res.set_content(arr.dump(), "application/json");
@@ -795,7 +839,7 @@ int main(int argc, char ** argv) {
     // the resolved local path can be surfaced to the UI and reused across launches without
     // re-downloading. Tracked as a run exactly like /api/launch, so GET /api/runs/{id} already
     // knows how to poll it - no new tracking code needed.
-    svr.Post("/api/models/download", [llama_download_path](const httplib::Request & req, httplib::Response & res) {
+    svr.Post("/api/models/download", [llama_download_path, download_dir](const httplib::Request & req, httplib::Response & res) {
         json body;
         try {
             body = json::parse(req.body);
@@ -824,7 +868,9 @@ int main(int argc, char ** argv) {
             argv_strs.push_back(hf_file);
         }
 
-        auto state = launch_process(argv_strs);
+        // CLUSTER_DOWNLOAD_DIR (default: MODELS_DIR) overrides where this download lands, via
+        // the child process's own LLAMA_CACHE - never by mutating this process's global env.
+        auto state = launch_process(argv_strs, {{"LLAMA_CACHE", download_dir}});
 
         std::string run_id;
         {
@@ -968,6 +1014,8 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "[cluster-ui] llama download: %s\n", llama_download_path.c_str());
     fprintf(stderr, "[cluster-ui] discover:       in-process (port %d, timeout %d ms)\n", ts_port, ts_timeout_ms);
     fprintf(stderr, "[cluster-ui] models dir:     %s\n", models_dir.c_str());
+    fprintf(stderr, "[cluster-ui] download dir:   %s%s\n", download_dir.c_str(),
+            download_dir == models_dir ? " (= models dir)" : "");
     fprintf(stderr, "[cluster-ui] static dir:     %s\n", static_dir.c_str());
     fprintf(stderr, "[cluster-ui] listening on http://%s:%d\n", host.c_str(), port);
 

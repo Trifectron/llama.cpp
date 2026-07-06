@@ -37,6 +37,10 @@ public:
     // sibling binary for its own HTTP /api/models/download handler.
     void set_download_binary_path(const std::string & path) { download_binary_path_ = path; }
 
+    // Per-node download destination (see cluster-ui.cpp's CLUSTER_DOWNLOAD_DIR handling) - passed
+    // as an LLAMA_CACHE override to the download subprocess's environment, never global env.
+    void set_download_dir(const std::string & dir) { download_dir_ = dir; }
+
     // Registers a runner prepared directly (no gRPC hop) by the origin's own launch handler for
     // its local head/tail segments. next_node_endpoint: where a *trunk* runner should forward to
     // after computing (empty for a tail runner - it never forwards, it completes the request).
@@ -67,6 +71,7 @@ private:
     std::map<std::string, std::shared_ptr<pending_request>> requests_;
 
     std::string download_binary_path_;
+    std::string download_dir_;
     std::mutex  downloads_mtx_;
     std::map<std::string, std::shared_ptr<run_state>> downloads_;
     uint64_t    next_download_id_ = 1;

@@ -12,6 +12,17 @@ extern char ** environ;
 #include <cstring>
 #include <thread>
 
+#ifdef _WIN32
+// Case-insensitive name compare, matching Windows environment-variable semantics.
+static bool env_name_matches(const std::string & a, const std::string & b) {
+    return _stricmp(a.c_str(), b.c_str()) == 0;
+}
+#else
+static bool env_name_matches(const std::string & a, const std::string & b) {
+    return a == b;
+}
+#endif
+
 std::string sibling_binary_path(const char * self_argv0, const char * name) {
     std::string self(self_argv0);
 #ifdef _WIN32
@@ -54,7 +65,51 @@ static std::string win_quote_arg(const std::string & arg) {
     return out;
 }
 
-std::shared_ptr<run_state> launch_process(const std::vector<std::string> & argv_strs) {
+// Builds a double-null-terminated ANSI environment block for CreateProcessA: a snapshot of this
+// process's own environment with `overrides` added or replacing same-named entries (Windows env
+// var names are case-insensitive). Reading via GetEnvironmentStringsA() only ever inspects the
+// calling process's environment - it doesn't mutate it, so this is safe to call concurrently
+// from multiple threads (unlike SetEnvironmentVariable(), which would race).
+static std::vector<char> build_env_block(const std::vector<std::pair<std::string, std::string>> & overrides) {
+    std::vector<char> block;
+
+    LPCH env_strings = GetEnvironmentStringsA();
+    if (env_strings) {
+        for (LPCH p = env_strings; *p != '\0'; ) {
+            const std::string entry(p);
+            // a leading '=' marks a per-drive-cwd pseudo-variable (e.g. "=C:=C:\foo") - never a
+            // name our overrides could match, so just pass it through untouched.
+            const size_t eq = entry.find('=');
+            const std::string name = (eq == std::string::npos || eq == 0) ? std::string() : entry.substr(0, eq);
+
+            bool overridden = false;
+            for (const auto & kv : overrides) {
+                if (!name.empty() && env_name_matches(name, kv.first)) {
+                    overridden = true;
+                    break;
+                }
+            }
+            if (!overridden) {
+                block.insert(block.end(), entry.begin(), entry.end());
+                block.push_back('\0');
+            }
+            p += entry.size() + 1;
+        }
+        FreeEnvironmentStringsA(env_strings);
+    }
+
+    for (const auto & kv : overrides) {
+        const std::string entry = kv.first + "=" + kv.second;
+        block.insert(block.end(), entry.begin(), entry.end());
+        block.push_back('\0');
+    }
+    block.push_back('\0'); // block-terminating extra NUL
+
+    return block;
+}
+
+std::shared_ptr<run_state> launch_process(const std::vector<std::string> & argv_strs,
+                                            const std::vector<std::pair<std::string, std::string>> & env_overrides) {
     auto state = std::make_shared<run_state>();
 
     SECURITY_ATTRIBUTES sa;
@@ -98,8 +153,17 @@ std::shared_ptr<run_state> launch_process(const std::vector<std::string> & argv_
     PROCESS_INFORMATION pi;
     memset(&pi, 0, sizeof(pi));
 
+    // env_overrides empty -> NULL, meaning "inherit my environment unchanged" (identical to the
+    // prior behavior); non-empty -> an explicit block built from a snapshot of it plus overrides.
+    std::vector<char> env_block;
+    LPVOID env_param = NULL;
+    if (!env_overrides.empty()) {
+        env_block = build_env_block(env_overrides);
+        env_param = env_block.data();
+    }
+
     const BOOL ok = CreateProcessA(argv_strs[0].c_str(), cmdline_buf.data(), NULL, NULL,
-                                   TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+                                   TRUE, CREATE_NO_WINDOW, env_param, NULL, &si, &pi);
     CloseHandle(pipe_wr);
     if (devnull != INVALID_HANDLE_VALUE) {
         CloseHandle(devnull);
@@ -139,7 +203,8 @@ std::shared_ptr<run_state> launch_process(const std::vector<std::string> & argv_
 
 #else
 
-std::shared_ptr<run_state> launch_process(const std::vector<std::string> & argv_strs) {
+std::shared_ptr<run_state> launch_process(const std::vector<std::string> & argv_strs,
+                                            const std::vector<std::pair<std::string, std::string>> & env_overrides) {
     auto state = std::make_shared<run_state>();
 
     int pipefd[2];
@@ -180,7 +245,44 @@ std::shared_ptr<run_state> launch_process(const std::vector<std::string> & argv_
         }
         argv.push_back(nullptr);
 
-        execve(argv[0], argv.data(), environ);
+        if (env_overrides.empty()) {
+            execve(argv[0], argv.data(), environ);
+        } else {
+            // build a fresh envp - a snapshot of this process's own environment, minus any
+            // names env_overrides replaces, plus the override entries. This is the forked
+            // child about to exec anyway, so building throwaway storage here doesn't race with
+            // the real parent process's environment at all (unlike calling setenv() in the
+            // parent before fork(), which would race against concurrent launch_process() calls
+            // from other request-handler threads).
+            std::vector<std::string> envp_strings;
+            for (char ** e = environ; *e != nullptr; ++e) {
+                const std::string entry(*e);
+                const size_t eq = entry.find('=');
+                const std::string name = (eq == std::string::npos) ? entry : entry.substr(0, eq);
+                bool overridden = false;
+                for (const auto & kv : env_overrides) {
+                    if (env_name_matches(name, kv.first)) {
+                        overridden = true;
+                        break;
+                    }
+                }
+                if (!overridden) {
+                    envp_strings.push_back(entry);
+                }
+            }
+            for (const auto & kv : env_overrides) {
+                envp_strings.push_back(kv.first + "=" + kv.second);
+            }
+
+            std::vector<char *> envp;
+            envp.reserve(envp_strings.size() + 1);
+            for (const auto & s : envp_strings) {
+                envp.push_back(const_cast<char *>(s.c_str()));
+            }
+            envp.push_back(nullptr);
+
+            execve(argv[0], argv.data(), envp.data());
+        }
         // execve only returns on failure
         fprintf(stderr, "error: execve(%s) failed: %s\n", argv[0], strerror(errno));
         _exit(127);
