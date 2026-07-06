@@ -51,13 +51,43 @@ Pass accelerator flags as CMake arguments. For example, on CUDA machines:
 The default build directory is `build-rpc`. Override it with
 `LLAMA_BUILD_DIR=/path/to/build`.
 
-By default the script builds `ggml-rpc-server`, `llama-cli`, and
-`llama-distributed-tap`. Override with
-`TARGETS="ggml-rpc-server llama-cli llama-server"` if you want more.
+By default the script builds `ggml-rpc-server`, `llama-cli`, `llama-app` (the
+`llama` binary - `download`/`serve`/`cli` subcommands), `llama-distributed-tap`,
+`llama-split-tap`, `llama-tailscale-discover`, and `llama-cluster-ui`. Override
+with e.g. `TARGETS="ggml-rpc-server llama-cli llama-server"` if you want fewer.
 
-## Start A Remote Node
+## Start A Node
 
-On each worker:
+The simplest way to join the cluster: build once, then run **`llama-cluster-ui`**
+on every machine, including workers. By default it always plays both roles at
+once - it exposes this machine's own compute to the pool (an embedded RPC
+server, no separate process) *and* serves the browser control panel you can
+use to discover peers, pick a model, and launch a run:
+
+```sh
+build-rpc/bin/llama-cluster-ui
+```
+
+That's the whole setup for a worker that only ever contributes compute and
+never drives a run itself. Env vars tune the embedded server half:
+
+```sh
+RPC_SERVE_HOST=0.0.0.0        # default - must be reachable by other peers
+RPC_SERVE_PORT=50052          # default, matches TAILSCALE_RPC_PORT's default
+RPC_SERVE_DEVICE=CUDA0        # optional: expose only one device
+RPC_SERVE_THREADS=8           # CPU backend threads
+RPC_SERVE_CACHE=1             # enable RPC tensor cache, default on
+RPC_SERVE_DISABLE=1           # opt this machine out of contributing compute entirely
+```
+
+See "Web Control Panel" below for the browser UI's own env vars
+(`CLUSTER_UI_HOST`, `CLUSTER_UI_PORT`, `MODELS_DIR`, ...).
+
+### Lower-level alternative: `ggml-rpc-server` directly
+
+If you'd rather run just the bare RPC server with no UI/download/discovery
+attached (e.g. a resource-constrained worker, or scripting/debugging), the
+standalone binary is still available:
 
 ```sh
 HOST=0.0.0.0 PORT=50052 ./prototypes/distributed-rpc/remote-node.sh
@@ -105,7 +135,47 @@ build-rpc/bin/llama-cli \
 discovery probe. See `--help` for `--tensor-split`, `--ctx-size`, and other flags.
 
 For a browser-based control panel instead (discover nodes, pick a model, set node order, launch,
-watch streamed output), see `llama-cluster-ui` below.
+watch streamed output), see "Web Control Panel" below.
+
+## Web Control Panel
+
+`llama-cluster-ui` is the single binary for the whole cluster workflow - see "Start A Node"
+above for how it plays both the server and client/host role at once. Run it and open
+`http://127.0.0.1:8787` (default) in a browser:
+
+```sh
+build-rpc/bin/llama-cluster-ui
+```
+
+From there you can:
+
+- **Discover nodes** - scans the Tailscale tailnet for peers confirmed to be running a
+  ggml-rpc-server (their own `llama-cluster-ui`'s embedded server, or a standalone
+  `ggml-rpc-server`/`remote-node.sh` - both look identical to discovery), and lets you reorder
+  them (pipeline/layer order).
+- **Pick or download a model** - lists local `.gguf` files under `MODELS_DIR`, or download one
+  directly from Hugging Face (`llama download -hf <repo>[:tag]` under the hood) with a live
+  progress panel.
+- **Launch** - runs `llama-cli --distributed <endpoints> --split-mode layer` with the chosen
+  model/prompt, and streams its output back to the page. **Stop** terminates the run.
+
+Env vars (all optional, sane defaults):
+
+```sh
+CLUSTER_UI_HOST=127.0.0.1     # UI bind address - loopback by default, unlike RPC_SERVE_HOST
+CLUSTER_UI_PORT=8787
+MODELS_DIR=prototypes/distributed-rpc/testdata
+CLUSTER_UI_STATIC_DIR=prototypes/distributed-rpc/ui
+TAILSCALE_RPC_PORT=50052
+TAILSCALE_CONNECT_TIMEOUT_MS=500
+```
+
+The UI's own HTTP server defaults to loopback-only (`127.0.0.1`) since it can launch arbitrary
+`llama-cli` invocations with no authentication - unlike the embedded RPC server half
+(`RPC_SERVE_HOST`, see "Start A Node"), which needs to be reachable by other machines to be
+useful and so defaults open. Setting `CLUSTER_UI_HOST` to a non-loopback address prints a loud
+warning; only do that over a trusted tailnet/VPN plus your own access control, never on an open
+network.
 
 ## C-Side GGML Tap
 

@@ -8,7 +8,7 @@ cd "${repo_root}"
 
 build_dir="${LLAMA_BUILD_DIR:-${repo_root}/build-rpc}"
 jobs="${JOBS:-}"
-targets_raw="${TARGETS:-ggml-rpc-server llama-cli llama-distributed-tap llama-split-tap llama-tailscale-discover llama-cluster-ui}"
+targets_raw="${TARGETS:-ggml-rpc-server llama-cli llama-app llama-distributed-tap llama-split-tap llama-tailscale-discover llama-cluster-ui}"
 
 read -r -a targets <<< "${targets_raw}"
 

@@ -1,20 +1,30 @@
 // Live control-panel backend for the distributed-rpc prototype (see plan.md and the plan file
-// history: "Live Cluster Control-Panel UI"). Serves a small browser UI that discovers Tailscale
-// peers running ggml-rpc-server, lists local GGUF models, and launches llama-cli directly - no
-// shell script in between (host-run.sh was removed; this replaces its one job).
+// history: "Live Cluster Control-Panel UI"). This is the single binary a friend on the cluster
+// ever needs to run: by default it always plays BOTH roles at once -
+//   - server: exposes this machine's own compute to the pool via an embedded ggml-rpc-server
+//     (same underlying ggml_backend_rpc_start_server() call tools/rpc/rpc-server.cpp uses, just
+//     run on a background thread here instead of its own process - no separate binary needed).
+//   - client/host: serves a browser UI that discovers Tailscale peers (in-process, via the
+//     shared tailscale_discovery module), lists/downloads GGUF models, and launches llama-cli
+//     directly (fork()+execve(), no shell) to actually run inference.
+// RPC_SERVE_DISABLE=1 opts a machine out of the server half if you only want it to drive/watch.
 //
-// This is the single, self-contained entry point for the whole cluster workflow: discovery is
-// in-process (via the shared tailscale_discovery module - the exact same logic
-// llama-tailscale-discover's standalone CLI uses, not a subprocess call to it), and launching is
-// a direct fork()+execve() of llama-cli. The only other binary this ever shells out to is
-// llama-cli itself, to actually run inference.
+// This binary shells out to two others purely as implementation details, never as something a
+// user runs by hand: `llama-cli` (inference) and `llama download` (the app/download.cpp
+// subcommand, for pulling models from Hugging Face).
 
 #include "tailscale_discovery.h"
+#include "cluster_layer_runner.h"
+#include "cluster_node_service.h"
+#include "coordinator_service.h"
+#include "subprocess_runner.h"
 
 #include "ggml-backend.h"
+#include "ggml-rpc.h"
 
 #include <cpp-httplib/httplib.h>
 #include <nlohmann/json.hpp>
+#include <grpcpp/grpcpp.h>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -32,12 +42,14 @@
 #include <sys/stat.h>
 #include <dirent.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -173,238 +185,189 @@ static bool read_gguf_meta(const std::string & path, gguf_meta & out) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Subprocess launching - fork()+execve() with an explicit argv array and explicit envp, never a
-// shell string. Model paths and prompt text pass through as literal argv entries; there is no
-// shell to interpret metacharacters in them.
+// Subprocess launching (run_state, launch_process(), sibling_binary_path()) now lives in
+// subprocess_runner.h/.cpp - shared with cluster_node_service.cpp's DownloadModel gRPC handler,
+// which launches the same `llama download` subprocess this file's /api/models/download does.
 // ---------------------------------------------------------------------------------------------
-
-struct run_state {
-#ifdef _WIN32
-    HANDLE      process = NULL;
-
-    ~run_state() {
-        if (process) {
-            CloseHandle(process);
-        }
-    }
-#else
-    pid_t       pid     = -1;
-#endif
-    std::mutex  mtx;
-    std::string output;
-    bool        running = true;
-    int         exit_code = -1;
-};
 
 static std::mutex                                    g_runs_mtx;
 static std::map<std::string, std::shared_ptr<run_state>> g_runs;
 static int                                            g_next_run_id = 1;
 
-// Resolves a sibling binary in the same directory this binary was launched from (e.g.
-// "llama-cli", "llama-tailscale-discover"), so cluster-ui works regardless of cwd as long as
-// it's run from the build's bin/ directory - matching how the other prototype tools are already
-// invoked (build-rpc/bin/...).
-static std::string sibling_binary_path(const char * self_argv0, const char * name) {
-    std::string self(self_argv0);
-#ifdef _WIN32
-    const size_t slash = self.find_last_of("/\\");
-    const std::string dir = (slash == std::string::npos) ? "." : self.substr(0, slash);
-    // CreateProcess requires an explicit extension in the application name
-    return dir + "\\" + name + ".exe";
-#else
-    const size_t slash = self.find_last_of('/');
-    const std::string dir = (slash == std::string::npos) ? "." : self.substr(0, slash);
-    return dir + "/" + name;
-#endif
+// ---------------------------------------------------------------------------------------------
+// Embedded RPC server (the "server" half of this binary's dual role) - a direct port of
+// tools/rpc/rpc-server.cpp's device-selection logic, calling the exact same underlying
+// ggml_backend_rpc_start_server() that binary uses. That function blocks forever serving
+// connections, so it runs on its own detached thread here rather than in main()'s thread, which
+// needs to go on to run the httplib server.
+// ---------------------------------------------------------------------------------------------
+
+// Mirrors tools/rpc/rpc-server.cpp's get_devices(): explicit device names if given, else all
+// non-CPU devices, falling back to the CPU device only if nothing else is available.
+static std::vector<ggml_backend_dev_t> rpc_serve_select_devices(const std::string & device_list_csv) {
+    std::vector<ggml_backend_dev_t> devices;
+
+    if (!device_list_csv.empty()) {
+        const std::regex regex{R"([,/]+)"};
+        std::sregex_token_iterator iter(device_list_csv.begin(), device_list_csv.end(), regex, -1);
+        std::sregex_token_iterator end;
+        for (; iter != end; ++iter) {
+            ggml_backend_dev_t dev = ggml_backend_dev_by_name(iter->str().c_str());
+            if (dev) {
+                devices.push_back(dev);
+            } else {
+                fprintf(stderr, "[cluster-ui] error: unknown RPC_SERVE_DEVICE entry: %s\n", iter->str().c_str());
+                return {};
+            }
+        }
+        return devices;
+    }
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devices.push_back(dev);
+        }
+    }
+    if (devices.empty()) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (dev) {
+            devices.push_back(dev);
+        }
+    }
+
+    return devices;
 }
 
-#ifdef _WIN32
+// Starts the embedded RPC server on a detached background thread. Returns false (logs and does
+// not start a thread) on a setup error; once the thread is running, failures inside
+// ggml_backend_rpc_start_server() itself are unrecoverable for the lifetime of the process, same
+// as the standalone ggml-rpc-server binary.
+static bool start_rpc_serve_background() {
+    const char * env_disable = getenv("RPC_SERVE_DISABLE");
+    if (env_disable && std::string(env_disable) == "1") {
+        fprintf(stderr, "[cluster-ui] RPC serve: disabled (RPC_SERVE_DISABLE=1) - this node will not contribute compute\n");
+        return true;
+    }
 
-// Quotes one argv entry per CommandLineToArgvW's rules: backslashes are literal unless they
-// precede a double quote, in which case they (and the quote) must be escaped.
-static std::string win_quote_arg(const std::string & arg) {
-    if (!arg.empty() && arg.find_first_of(" \t\"") == std::string::npos) {
-        return arg;
+    const char * env_host    = getenv("RPC_SERVE_HOST");
+    const char * env_port    = getenv("RPC_SERVE_PORT");
+    const char * env_threads = getenv("RPC_SERVE_THREADS");
+    const char * env_devices = getenv("RPC_SERVE_DEVICE");
+    const char * env_cache   = getenv("RPC_SERVE_CACHE");
+
+    // defaults to 0.0.0.0:50052 - unlike CLUSTER_UI_HOST (the browser UI, loopback by default for
+    // safety), this half of the binary is only useful if other tailnet peers can actually reach
+    // it, so it defaults open rather than closed. Same port default as TAILSCALE_RPC_PORT, so two
+    // machines both running this binary with zero configuration can discover each other.
+    const std::string host    = env_host    ? env_host    : "0.0.0.0";
+    const int         port    = env_port    ? atoi(env_port) : 50052;
+    const int         threads = env_threads ? atoi(env_threads) : (int) std::max(1U, std::thread::hardware_concurrency() / 2);
+    const bool        use_cache = env_cache ? (std::string(env_cache) != "0") : true;
+
+    if (host != "127.0.0.1" && host != "localhost" && host != "::1") {
+        fprintf(stderr,
+            "\n"
+            "*** NOTE: RPC serve is bound to %s:%d - reachable by other machines on your      ***\n"
+            "*** network/tailnet, which is required for them to use this node's compute.      ***\n"
+            "*** The RPC protocol has no authentication - only run this on a trusted network  ***\n"
+            "*** (e.g. a private Tailscale tailnet), never expose it to the open internet.    ***\n"
+            "*** Set RPC_SERVE_DISABLE=1 to opt this machine out of contributing compute.      ***\n"
+            "\n",
+            host.c_str(), port);
     }
-    std::string out = "\"";
-    size_t n_backslash = 0;
-    for (const char c : arg) {
-        if (c == '\\') {
-            n_backslash++;
-            continue;
-        }
-        if (c == '"') {
-            out.append(n_backslash * 2 + 1, '\\');
-        } else {
-            out.append(n_backslash, '\\');
-        }
-        out += c;
-        n_backslash = 0;
+
+    std::vector<ggml_backend_dev_t> devices = rpc_serve_select_devices(env_devices ? env_devices : "");
+    if (devices.empty()) {
+        fprintf(stderr, "[cluster-ui] error: RPC serve found no usable devices\n");
+        return false;
     }
-    out.append(n_backslash * 2, '\\');
-    out += '"';
-    return out;
+
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+    if (!reg) {
+        fprintf(stderr, "[cluster-ui] error: RPC backend not found; rebuild with -DGGML_RPC=ON\n");
+        return false;
+    }
+    auto start_server_fn = (decltype(ggml_backend_rpc_start_server) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
+    if (!start_server_fn) {
+        fprintf(stderr, "[cluster-ui] error: RPC start-server function not found\n");
+        return false;
+    }
+
+    std::string cache_dir_str;
+    if (use_cache) {
+        const char * llama_cache_env = getenv("LLAMA_CACHE");
+        const char * home_env        = getenv("HOME");
+        cache_dir_str = (llama_cache_env ? std::string(llama_cache_env)
+                                          : std::string(home_env ? home_env : ".") + "/.cache/llama.cpp") + "/rpc/";
+
+        // best-effort recursive mkdir (no shell involved) - if this doesn't exist,
+        // ggml_backend_rpc_start_server can still run without a working cache, not worth
+        // failing startup over.
+        std::string partial;
+        for (size_t pos = 1; pos <= cache_dir_str.size(); ++pos) {
+            if (pos == cache_dir_str.size() || cache_dir_str[pos] == '/') {
+                partial = cache_dir_str.substr(0, pos);
+                if (!partial.empty()) {
+                    mkdir(partial.c_str(), 0755);
+                }
+            }
+        }
+    }
+
+    fprintf(stderr, "[cluster-ui] RPC serve:      %s:%d (%zu device(s), %d thread(s), cache=%s)\n",
+            host.c_str(), port, devices.size(), threads, use_cache ? "on" : "off");
+
+    const std::string endpoint = host + ":" + std::to_string(port);
+    // cache_dir_str/devices are captured by value, so they live in the thread's own storage for
+    // as long as the (never-returning) server call runs.
+    std::thread([start_server_fn, endpoint, cache_dir_str, use_cache, threads, devices]() mutable {
+        start_server_fn(endpoint.c_str(), use_cache ? cache_dir_str.c_str() : nullptr,
+                         threads, devices.size(), const_cast<ggml_backend_dev_t *>(devices.data()));
+    }).detach();
+
+    return true;
 }
 
-static std::shared_ptr<run_state> launch_process(const std::vector<std::string> & argv_strs) {
-    auto state = std::make_shared<run_state>();
+// ---------------------------------------------------------------------------------------------
+// Embedded gRPC server - hosts both the Coordinator and ClusterNode services (see
+// proto/cluster.proto) on one port, symmetric with the RPC-serve half above: every
+// llama-cluster-ui instance is reachable both as a cluster member (this) and as a plain compute
+// device (ggml-rpc, above). grpc++ is a build-time library dependency only, exactly like
+// cpp-httplib - there is no separate running process for any of this.
+// ---------------------------------------------------------------------------------------------
 
-    SECURITY_ATTRIBUTES sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.nLength        = sizeof(sa);
-    sa.bInheritHandle = TRUE;
+// Global service instances - the gRPC server holds non-owning pointers to these (standard
+// grpc::ServerBuilder::RegisterService() usage), and the /api/launch-grpc handler drives
+// cluster_node_service directly (register_local_runner()/wait_for_tail_result()) for the
+// origin's own head/tail segments, so both need process-lifetime storage.
+static coordinator_service   g_coordinator;
+static cluster_node_service  g_cluster_node;
 
-    HANDLE pipe_rd = NULL;
-    HANDLE pipe_wr = NULL;
-    if (!CreatePipe(&pipe_rd, &pipe_wr, &sa, 0)) {
-        state->running   = false;
-        state->exit_code = -1;
-        state->output    = "error: CreatePipe() failed\n";
-        return state;
+static bool start_cluster_grpc_server(const std::string & host, int port) {
+    const std::string endpoint = host + ":" + std::to_string(port);
+
+    grpc::ServerBuilder builder;
+    builder.AddListeningPort(endpoint, grpc::InsecureServerCredentials());
+    builder.RegisterService(&g_coordinator);
+    builder.RegisterService(&g_cluster_node);
+
+    std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+    if (!server) {
+        fprintf(stderr, "[cluster-ui] error: failed to start cluster gRPC server on %s\n", endpoint.c_str());
+        return false;
     }
-    // only the write end may be inherited by the child
-    SetHandleInformation(pipe_rd, HANDLE_FLAG_INHERIT, 0);
 
-    // never let the child block waiting for interactive input - it has no terminal here.
-    HANDLE devnull = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
-                                 OPEN_EXISTING, 0, NULL);
+    fprintf(stderr, "[cluster-ui] cluster gRPC:    %s (Coordinator + ClusterNode)\n", endpoint.c_str());
 
-    std::string cmdline;
-    for (const auto & s : argv_strs) {
-        if (!cmdline.empty()) {
-            cmdline += ' ';
-        }
-        cmdline += win_quote_arg(s);
-    }
-    std::vector<char> cmdline_buf(cmdline.begin(), cmdline.end());
-    cmdline_buf.push_back('\0');
+    // server->Wait() blocks forever - same "own detached thread" pattern as the RPC-serve half.
+    // The unique_ptr is moved into the thread's storage so the server object outlives this call.
+    std::thread([srv = std::shared_ptr<grpc::Server>(std::move(server))]() {
+        srv->Wait();
+    }).detach();
 
-    STARTUPINFOA si;
-    memset(&si, 0, sizeof(si));
-    si.cb         = sizeof(si);
-    si.dwFlags    = STARTF_USESTDHANDLES;
-    si.hStdInput  = devnull;
-    si.hStdOutput = pipe_wr;
-    si.hStdError  = pipe_wr;
-
-    PROCESS_INFORMATION pi;
-    memset(&pi, 0, sizeof(pi));
-
-    const BOOL ok = CreateProcessA(argv_strs[0].c_str(), cmdline_buf.data(), NULL, NULL,
-                                   TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-    CloseHandle(pipe_wr);
-    if (devnull != INVALID_HANDLE_VALUE) {
-        CloseHandle(devnull);
-    }
-    if (!ok) {
-        CloseHandle(pipe_rd);
-        state->running   = false;
-        state->exit_code = -1;
-        state->output    = "error: CreateProcess(" + argv_strs[0] + ") failed\n";
-        return state;
-    }
-    CloseHandle(pi.hThread);
-    state->process = pi.hProcess;
-
-    std::thread reader([state, pipe_rd]() {
-        char  buf[4096];
-        DWORD n = 0;
-        // ReadFile fails with ERROR_BROKEN_PIPE once the child exits and the pipe drains
-        while (ReadFile(pipe_rd, buf, sizeof(buf), &n, NULL) && n > 0) {
-            std::lock_guard<std::mutex> lock(state->mtx);
-            state->output.append(buf, (size_t) n);
-        }
-        CloseHandle(pipe_rd);
-
-        WaitForSingleObject(state->process, INFINITE);
-        DWORD code = (DWORD) -1;
-        GetExitCodeProcess(state->process, &code);
-
-        std::lock_guard<std::mutex> lock(state->mtx);
-        state->running   = false;
-        state->exit_code = (int) code;
-    });
-    reader.detach();
-
-    return state;
+    return true;
 }
-
-#else
-
-static std::shared_ptr<run_state> launch_process(const std::vector<std::string> & argv_strs) {
-    auto state = std::make_shared<run_state>();
-
-    int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        state->running   = false;
-        state->exit_code = -1;
-        state->output    = "error: pipe() failed\n";
-        return state;
-    }
-
-    const pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        state->running   = false;
-        state->output    = "error: fork() failed\n";
-        return state;
-    }
-
-    if (pid == 0) {
-        // child
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[1]);
-
-        // never let the child block waiting for interactive input - it has no terminal here.
-        const int devnull = open("/dev/null", O_RDONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDIN_FILENO);
-            close(devnull);
-        }
-
-        std::vector<char *> argv;
-        argv.reserve(argv_strs.size() + 1);
-        for (const auto & s : argv_strs) {
-            argv.push_back(const_cast<char *>(s.c_str()));
-        }
-        argv.push_back(nullptr);
-
-        execve(argv[0], argv.data(), environ);
-        // execve only returns on failure
-        fprintf(stderr, "error: execve(%s) failed: %s\n", argv[0], strerror(errno));
-        _exit(127);
-    }
-
-    // parent
-    close(pipefd[1]);
-    state->pid = pid;
-
-    const int read_fd = pipefd[0];
-    std::thread reader([state, read_fd, pid]() {
-        char buf[4096];
-        ssize_t n;
-        while ((n = read(read_fd, buf, sizeof(buf))) > 0) {
-            std::lock_guard<std::mutex> lock(state->mtx);
-            state->output.append(buf, (size_t) n);
-        }
-        close(read_fd);
-
-        int status = 0;
-        waitpid(pid, &status, 0);
-
-        std::lock_guard<std::mutex> lock(state->mtx);
-        state->running   = false;
-        state->exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    });
-    reader.detach();
-
-    return state;
-}
-
-#endif // _WIN32
 
 // ---------------------------------------------------------------------------------------------
 // main
@@ -433,15 +396,43 @@ int main(int argc, char ** argv) {
             host.c_str());
     }
 
-    const std::string llama_cli_path = sibling_binary_path(argv[0], "llama-cli");
+    const std::string llama_cli_path      = sibling_binary_path(argv[0], "llama-cli");
+    const std::string llama_download_path = sibling_binary_path(argv[0], "llama");
+
+    // lets the ClusterNode service's DownloadModel gRPC handler launch the same subprocess
+    // /api/models/download uses over HTTP, on this node instead of just the origin's own.
+    g_cluster_node.set_download_binary_path(llama_download_path);
 
     const char * env_ts_port    = getenv("TAILSCALE_RPC_PORT");
     const char * env_ts_timeout = getenv("TAILSCALE_CONNECT_TIMEOUT_MS");
     const int    ts_port        = env_ts_port    ? atoi(env_ts_port)    : 50052;
     const int    ts_timeout_ms  = env_ts_timeout ? atoi(env_ts_timeout) : 500;
 
-    // one-time backend registry scan, needed by tailscale_discover_nodes()'s RPC handshake step.
+    // one-time backend registry scan, needed by tailscale_discover_nodes()'s RPC handshake step
+    // and by the embedded RPC server below.
     ggml_backend_load_all();
+
+    // "server" half of this binary's dual role - see the file header comment. Runs on its own
+    // background thread; failure here is logged but doesn't prevent the UI half from starting.
+    if (!start_rpc_serve_background()) {
+        fprintf(stderr, "[cluster-ui] warning: RPC serve failed to start; this node will not contribute compute\n");
+    }
+
+    const char * env_grpc_host = getenv("CLUSTER_GRPC_HOST");
+    const char * env_grpc_port = getenv("CLUSTER_GRPC_PORT");
+    const std::string grpc_host = env_grpc_host ? env_grpc_host : "0.0.0.0"; // same reasoning as RPC_SERVE_HOST
+    const int          grpc_port = env_grpc_port ? atoi(env_grpc_port) : 50053;
+
+    if (!start_cluster_grpc_server(grpc_host, grpc_port)) {
+        fprintf(stderr, "[cluster-ui] warning: cluster gRPC server failed to start; this node cannot join a gRPC pipeline\n");
+    }
+
+    // Where a remote trunk node's final PassOff should reach *this* node when it's the origin -
+    // best-effort default for local/loopback testing; override for real multi-machine tailnet
+    // use (this phase does not attempt automatic Tailscale self-IP detection - see plan notes).
+    const char * env_self_endpoint = getenv("CLUSTER_GRPC_SELF_ENDPOINT");
+    const std::string self_endpoint = env_self_endpoint ? env_self_endpoint
+                                                          : ("127.0.0.1:" + std::to_string(grpc_port));
 
     httplib::Server svr;
 
@@ -467,6 +458,22 @@ int main(int argc, char ** argv) {
                 {"endpoint",    node.endpoint},
                 {"free_bytes",  node.free_bytes},
                 {"total_bytes", node.total_bytes},
+            });
+        }
+        res.set_content(arr.dump(), "application/json");
+    });
+
+    // Debug/inspection endpoint for the Coordinator service's in-memory member table (see
+    // plan file history's verification notes) - also generally useful once the UI wants to show
+    // "who has said Hello to me" independent of a fresh Tailscale scan.
+    svr.Get("/api/members", [](const httplib::Request &, httplib::Response & res) {
+        json arr = json::array();
+        for (const auto & m : g_coordinator.snapshot_members()) {
+            arr.push_back({
+                {"node_id",              m.node_id()},
+                {"rpc_endpoint",         m.rpc_endpoint()},
+                {"cluster_node_endpoint", m.cluster_node_endpoint()},
+                {"free_vram_bytes",      m.caps().free_vram_bytes()},
             });
         }
         res.set_content(arr.dump(), "application/json");
@@ -499,6 +506,32 @@ int main(int argc, char ** argv) {
         res.set_content(arr.dump(), "application/json");
     });
 
+    // Reads GGUF metadata for an arbitrary absolute path - used for models resolved via
+    // /api/models/download, which typically live in llama.cpp's HF cache directory rather than
+    // `models_dir`, so they don't show up in the /api/models scan above.
+    svr.Get("/api/model-meta", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string path = req.get_param_value("path");
+        if (path.empty()) {
+            res.status = 400;
+            res.set_content(json{{"error", "path query parameter is required"}}.dump(), "application/json");
+            return;
+        }
+
+        gguf_meta meta;
+        if (!read_gguf_meta(path, meta)) {
+            res.status = 404;
+            res.set_content(json{{"error", "failed to read GGUF metadata for path"}}.dump(), "application/json");
+            return;
+        }
+
+        res.set_content(json{
+            {"path",       path},
+            {"arch",       meta.arch},
+            {"n_layers",   meta.n_layers},
+            {"size_bytes", meta.size_bytes},
+        }.dump(), "application/json");
+    });
+
     svr.Post("/api/launch", [llama_cli_path](const httplib::Request & req, httplib::Response & res) {
         json body;
         try {
@@ -511,7 +544,24 @@ int main(int argc, char ** argv) {
 
         const std::string model_path = body.value("model_path", "");
         const std::string prompt     = body.value("prompt", "");
-        const int          n_predict = body.value("n_predict", 64);
+
+        // Read as int64 rather than int: nlohmann::json's value<int>() silently truncates an
+        // out-of-range JSON number (e.g. wraps to INT32_MIN) instead of throwing, so validating
+        // only after a narrowing get<int>() would already be too late. Bound-check explicitly
+        // before it ever becomes the process's -n argument.
+        int64_t n_predict_wide = 64;
+        try {
+            n_predict_wide = body.value("n_predict", (int64_t) 64);
+        } catch (const json::exception &) {
+            // non-numeric n_predict (e.g. a string) - fall through to the range check below,
+            // which will reject the default-preserving 64 only if that's somehow out of range.
+        }
+        if (n_predict_wide < 1 || n_predict_wide > 65536) {
+            res.status = 400;
+            res.set_content(json{{"error", "n_predict must be between 1 and 65536"}}.dump(), "application/json");
+            return;
+        }
+        const int n_predict = (int) n_predict_wide;
 
         struct stat st;
         if (model_path.empty() || stat(model_path.c_str(), &st) != 0) {
@@ -557,6 +607,311 @@ int main(int argc, char ** argv) {
         }
 
         res.set_content(json{{"run_id", run_id}}.dump(), "application/json");
+    });
+
+    // Real U-shaped gRPC pipeline (see plan file history: "gRPC Coordinator/ClusterNode
+    // Implementation"). Unlike /api/launch above (plain --distributed, whole model split flatly
+    // across visible devices), this keeps the head (embedding + first layers) and tail (last
+    // layers + lm_head + sampling) local to this node, and delegates only the middle "trunk"
+    // range to remote peers via real Hello + AssignLayers + PassOff gRPC calls. [phase scope]
+    // proves one forward pass (prompt -> hidden-state hand-off chain -> one sampled token), not
+    // full autoregressive generation - see plan notes for what's deferred.
+    //
+    // Body: {model_path, prompt, head_layers, tail_layers,
+    //        trunk: [{endpoint, layer_start, layer_end}, ...]}  (already computed client-side by
+    //        the same proportional-split JS used for the illustrative preview elsewhere in the UI)
+    svr.Post("/api/launch-grpc", [self_endpoint](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const json::exception & e) {
+            res.status = 400;
+            res.set_content(json{{"error", std::string("invalid JSON: ") + e.what()}}.dump(), "application/json");
+            return;
+        }
+
+        const std::string model_path = body.value("model_path", "");
+        const std::string prompt     = body.value("prompt", "");
+
+        struct stat st;
+        if (model_path.empty() || stat(model_path.c_str(), &st) != 0) {
+            res.status = 400;
+            res.set_content(json{{"error", "model_path does not exist"}}.dump(), "application/json");
+            return;
+        }
+
+        gguf_meta meta;
+        if (!read_gguf_meta(model_path, meta) || meta.n_layers == 0) {
+            res.status = 400;
+            res.set_content(json{{"error", "failed to read model layer count"}}.dump(), "application/json");
+            return;
+        }
+        const int32_t n_layer = (int32_t) meta.n_layers;
+
+        int64_t head_layers_wide = body.value("head_layers", (int64_t) 1);
+        int64_t tail_layers_wide = body.value("tail_layers", (int64_t) 1);
+        // head_layers + tail_layers == n_layer is valid (empty trunk, fully local); only
+        // exceeding n_layer is an actual error (would mean tail_start < head_end, an overlap).
+        if (head_layers_wide < 1 || tail_layers_wide < 1 || head_layers_wide + tail_layers_wide > n_layer) {
+            res.status = 400;
+            res.set_content(json{{"error", "head_layers/tail_layers out of range for this model's layer count"}}.dump(), "application/json");
+            return;
+        }
+        const int32_t head_end   = (int32_t) head_layers_wide;
+        const int32_t tail_start = n_layer - (int32_t) tail_layers_wide;
+
+        struct trunk_hop {
+            std::string endpoint;
+            int32_t     layer_start;
+            int32_t     layer_end;
+        };
+        std::vector<trunk_hop> trunk;
+        if (body.contains("trunk") && body["trunk"].is_array()) {
+            for (const auto & hop : body["trunk"]) {
+                trunk.push_back({hop.value("endpoint", ""), (int32_t) hop.value("layer_start", 0),
+                                  (int32_t) hop.value("layer_end", 0)});
+            }
+        }
+
+        // Every layer index in [head_end, tail_start) must be covered by exactly one hop, with
+        // no gaps or overlaps - otherwise a hidden state gets handed to a runner expecting a
+        // different layer boundary than what was actually computed, silently producing garbage
+        // rather than a clear error.
+        {
+            int32_t expected_start = head_end;
+            bool    coverage_ok    = true;
+            for (const auto & hop : trunk) {
+                if (hop.layer_start != expected_start) {
+                    coverage_ok = false;
+                    break;
+                }
+                expected_start = hop.layer_end;
+            }
+            if (!coverage_ok || expected_start != tail_start) {
+                res.status = 400;
+                res.set_content(json{{"error", "trunk layer ranges must contiguously cover [head_end, tail_start) with no gaps or overlaps"}}.dump(), "application/json");
+                return;
+            }
+        }
+
+        static std::mutex     request_id_mtx;
+        static uint64_t       next_request_id = 1;
+        std::string request_id;
+        {
+            std::lock_guard<std::mutex> lock(request_id_mtx);
+            request_id = "req-" + std::to_string(next_request_id++);
+        }
+
+        // 1. Hello + AssignLayers each trunk node in order, chaining next_node_endpoint through
+        //    to either the next trunk node or, for the last one, back to this node (self_endpoint).
+        for (size_t i = 0; i < trunk.size(); ++i) {
+            const std::string next = (i + 1 < trunk.size()) ? trunk[i + 1].endpoint : self_endpoint;
+
+            llama_cluster::HelloRequest  hello_req;
+            llama_cluster::HelloResponse hello_res;
+            hello_req.set_node_id("origin-" + request_id);
+            hello_req.set_cluster_node_endpoint(self_endpoint);
+            std::string hello_err;
+            if (!cluster_grpc_call_hello(trunk[i].endpoint, hello_req, hello_res, hello_err)) {
+                res.status = 502;
+                res.set_content(json{{"error", "Hello to " + trunk[i].endpoint + " failed: " + hello_err}}.dump(), "application/json");
+                return;
+            }
+
+            llama_cluster::AssignLayersRequest  assign_req;
+            llama_cluster::AssignLayersResponse assign_res;
+            assign_req.set_request_id(request_id);
+            assign_req.set_model_path(model_path);
+            assign_req.set_layer_start((uint32_t) trunk[i].layer_start);
+            assign_req.set_layer_end((uint32_t) trunk[i].layer_end);
+            assign_req.set_next_node_endpoint(next);
+            std::string assign_err;
+            if (!cluster_grpc_call_assign_layers(trunk[i].endpoint, assign_req, assign_res, assign_err)) {
+                res.status = 502;
+                res.set_content(json{{"error", "AssignLayers to " + trunk[i].endpoint + " failed: " + assign_err}}.dump(), "application/json");
+                return;
+            }
+            if (!assign_res.accepted()) {
+                res.status = 502;
+                res.set_content(json{{"error", trunk[i].endpoint + " rejected AssignLayers: " + assign_res.reject_reason()}}.dump(), "application/json");
+                return;
+            }
+        }
+
+        // 2. Register this node's own tail runner *before* kicking off the chain, so an
+        //    early-arriving PassOff can never race past an unregistered request_id.
+        auto tail_runner = std::make_unique<cluster_layer_runner>();
+        std::string tail_error;
+        if (!tail_runner->prepare(model_path, tail_start, n_layer, /*n_ctx=*/4096, tail_error)) {
+            res.status = 500;
+            res.set_content(json{{"error", "failed to prepare local tail: " + tail_error}}.dump(), "application/json");
+            return;
+        }
+        g_cluster_node.register_local_runner(request_id, std::move(tail_runner), /*next_node_endpoint=*/"");
+
+        // 3. Run this node's own head locally (never a self-directed gRPC hop).
+        cluster_layer_runner head_runner;
+        std::string head_error;
+        if (!head_runner.prepare(model_path, 0, head_end, /*n_ctx=*/4096, head_error)) {
+            res.status = 500;
+            res.set_content(json{{"error", "failed to prepare local head: " + head_error}}.dump(), "application/json");
+            return;
+        }
+        cluster_hidden_state hidden;
+        if (!head_runner.run_head(prompt, hidden, head_error)) {
+            res.status = 500;
+            res.set_content(json{{"error", "local head failed: " + head_error}}.dump(), "application/json");
+            return;
+        }
+
+        // 4. Hand off to the first trunk node (or straight back to this node's own tail if no
+        //    trunk nodes were selected - a degenerate but valid all-local U "split").
+        const std::string first_hop = trunk.empty() ? self_endpoint : trunk.front().endpoint;
+        std::string pass_off_error;
+        if (!cluster_grpc_send_pass_off(first_hop, request_id, hidden, pass_off_error)) {
+            res.status = 502;
+            res.set_content(json{{"error", "initial PassOff to " + first_hop + " failed: " + pass_off_error}}.dump(), "application/json");
+            return;
+        }
+
+        // 5. Wait for the tail (this node's own PassOff handler) to complete the request.
+        cluster_tail_result result;
+        std::string wait_error;
+        if (!g_cluster_node.wait_for_tail_result(request_id, /*timeout_ms=*/30000, result, wait_error)) {
+            res.status = 504;
+            res.set_content(json{{"error", "pipeline did not complete: " + wait_error}}.dump(), "application/json");
+            return;
+        }
+
+        res.set_content(json{
+            {"token",   result.token},
+            {"piece",   result.piece},
+            {"is_eog",  result.is_eog},
+        }.dump(), "application/json");
+    });
+
+    // Downloads a model from Hugging Face via the `llama download` subcommand (app/download.cpp)
+    // - the same tool `llama-cli --hf-repo` uses internally, just as a standalone step here so
+    // the resolved local path can be surfaced to the UI and reused across launches without
+    // re-downloading. Tracked as a run exactly like /api/launch, so GET /api/runs/{id} already
+    // knows how to poll it - no new tracking code needed.
+    svr.Post("/api/models/download", [llama_download_path](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const json::exception & e) {
+            res.status = 400;
+            res.set_content(json{{"error", std::string("invalid JSON: ") + e.what()}}.dump(), "application/json");
+            return;
+        }
+
+        const std::string hf_repo = body.value("hf_repo", "");
+        const std::string hf_file = body.value("hf_file", "");
+
+        if (hf_repo.empty()) {
+            res.status = 400;
+            res.set_content(json{{"error", "hf_repo is required"}}.dump(), "application/json");
+            return;
+        }
+
+        std::vector<std::string> argv_strs = {
+            llama_download_path,
+            "download",
+            "-hf", hf_repo,
+        };
+        if (!hf_file.empty()) {
+            argv_strs.push_back("-hff");
+            argv_strs.push_back(hf_file);
+        }
+
+        auto state = launch_process(argv_strs);
+
+        std::string run_id;
+        {
+            std::lock_guard<std::mutex> lock(g_runs_mtx);
+            run_id = std::to_string(g_next_run_id++);
+            g_runs[run_id] = state;
+        }
+
+        res.set_content(json{{"run_id", run_id}}.dump(), "application/json");
+    });
+
+    // Remote-node model provisioning over the cluster gRPC protocol's DownloadModel/
+    // GetDownloadStatus RPCs (proto/cluster.proto) - lets the origin ensure a trunk node has a
+    // model on disk before AssignLayers is called against it, the same way /api/models/download
+    // above provisions the origin's own local model. Body: {endpoint, hf_repo, hf_file}.
+    svr.Post("/api/nodes/download", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const json::exception & e) {
+            res.status = 400;
+            res.set_content(json{{"error", std::string("invalid JSON: ") + e.what()}}.dump(), "application/json");
+            return;
+        }
+
+        const std::string endpoint = body.value("endpoint", "");
+        const std::string hf_repo  = body.value("hf_repo", "");
+        const std::string hf_file  = body.value("hf_file", "");
+
+        if (endpoint.empty() || hf_repo.empty()) {
+            res.status = 400;
+            res.set_content(json{{"error", "endpoint and hf_repo are required"}}.dump(), "application/json");
+            return;
+        }
+
+        llama_cluster::DownloadModelRequest  grpc_req;
+        llama_cluster::DownloadModelResponse grpc_res;
+        grpc_req.set_hf_repo(hf_repo);
+        grpc_req.set_hf_file(hf_file);
+
+        std::string error;
+        if (!cluster_grpc_call_download_model(endpoint, grpc_req, grpc_res, error)) {
+            res.status = 502;
+            res.set_content(json{{"error", "DownloadModel to " + endpoint + " failed: " + error}}.dump(), "application/json");
+            return;
+        }
+        if (!grpc_res.accepted()) {
+            res.status = 400;
+            res.set_content(json{{"error", grpc_res.reject_reason()}}.dump(), "application/json");
+            return;
+        }
+
+        res.set_content(json{{"download_id", grpc_res.download_id()}}.dump(), "application/json");
+    });
+
+    svr.Get("/api/nodes/download-status", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string endpoint    = req.get_param_value("endpoint");
+        const std::string download_id = req.get_param_value("download_id");
+
+        if (endpoint.empty() || download_id.empty()) {
+            res.status = 400;
+            res.set_content(json{{"error", "endpoint and download_id query parameters are required"}}.dump(), "application/json");
+            return;
+        }
+
+        llama_cluster::GetDownloadStatusRequest  grpc_req;
+        llama_cluster::GetDownloadStatusResponse grpc_res;
+        grpc_req.set_download_id(download_id);
+
+        std::string error;
+        if (!cluster_grpc_call_get_download_status(endpoint, grpc_req, grpc_res, error)) {
+            res.status = 502;
+            res.set_content(json{{"error", "GetDownloadStatus to " + endpoint + " failed: " + error}}.dump(), "application/json");
+            return;
+        }
+
+        const char * state_name =
+            grpc_res.state() == llama_cluster::DOWNLOAD_STATE_RUNNING ? "running" :
+            grpc_res.state() == llama_cluster::DOWNLOAD_STATE_DONE    ? "done" :
+            grpc_res.state() == llama_cluster::DOWNLOAD_STATE_FAILED  ? "failed" : "unknown";
+
+        res.set_content(json{
+            {"state",       state_name},
+            {"model_path",  grpc_res.model_path()},
+            {"error",       grpc_res.error()},
+            {"output_tail", grpc_res.output_tail()},
+        }.dump(), "application/json");
     });
 
     svr.Get("/api/runs/:id", [](const httplib::Request & req, httplib::Response & res) {
@@ -610,6 +965,7 @@ int main(int argc, char ** argv) {
     });
 
     fprintf(stderr, "[cluster-ui] llama-cli:      %s\n", llama_cli_path.c_str());
+    fprintf(stderr, "[cluster-ui] llama download: %s\n", llama_download_path.c_str());
     fprintf(stderr, "[cluster-ui] discover:       in-process (port %d, timeout %d ms)\n", ts_port, ts_timeout_ms);
     fprintf(stderr, "[cluster-ui] models dir:     %s\n", models_dir.c_str());
     fprintf(stderr, "[cluster-ui] static dir:     %s\n", static_dir.c_str());

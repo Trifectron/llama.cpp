@@ -50,10 +50,27 @@
   .status { font-family: var(--mono); font-size: 13px; }
   .status.ok { color: var(--ok); }
   .status.err { color: var(--err); }
+  .errbox { border: 1px solid var(--err); background: rgba(255,107,107,0.08); color: var(--err); border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-top: 8px; }
 
-  .bar { display: flex; height: 40px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); margin: 10px 0; }
-  .seg { display: flex; align-items: center; justify-content: center; color: #0f1419; font-family: var(--mono); font-size: 11px; overflow: hidden; white-space: nowrap; }
-  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: baseline; }
+  /* segmented bar: a 2px surface-color gap separates touching segments (dataviz skill spacer
+     rule) instead of segments blending directly into each other with no separation. */
+  .bar { display: flex; gap: 2px; height: 34px; border-radius: 8px; background: var(--bg); padding: 2px; margin: 10px 0; }
+  .seg { display: flex; align-items: center; justify-content: center; color: #0f1419; font-family: var(--mono); font-size: 11px; overflow: hidden; white-space: nowrap; border-radius: 5px; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: baseline; flex-shrink: 0; }
+
+  /* legend: identity must never rely on hover alone (dataviz skill) - always visible beside the
+     bar it explains. */
+  .legend { display: flex; flex-wrap: wrap; gap: 5px 18px; margin-top: 8px; font-size: 12.5px; }
+  .legend-item { display: flex; align-items: center; gap: 2px; }
+  .legend-item .lcount { color: var(--muted); font-family: var(--mono); margin-left: 4px; }
+
+  /* capacity meter: fill is the sequential "blue" hue per the dataviz palette; track recedes
+     into the dark surface rather than using a light step (this UI is fixed-dark, not
+     light/dark-switching, so the track intentionally goes darker, not lighter, than the fill). */
+  .meter-cell { display: flex; flex-direction: column; gap: 3px; min-width: 120px; }
+  .meter-track { background: var(--code-bg); border-radius: 4px; height: 6px; width: 100%; overflow: hidden; }
+  .meter-fill { height: 100%; border-radius: 4px; background: #3987e5; }
+  .meter-label { font-family: var(--mono); font-size: 11.5px; color: var(--muted); white-space: nowrap; }
 
   .out {
     background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
@@ -76,12 +93,16 @@
 
 <h2>1. Nodes</h2>
 <div class="panel">
+  <p class="sub" style="color:var(--muted);margin-top:0">Each node's color below is stable and
+  follows the node itself, not its row position - reordering never repaints anyone. Only free/
+  total memory is shown for "capacity": the RPC protocol these nodes speak doesn't report GPU
+  model names, so none are guessed here - a node is CPU or GPU-backed compute of the reported size.</p>
   <div class="row">
     <button id="btnDiscover">Discover nodes</button>
     <span id="discoverStatus" class="status muted"></span>
   </div>
   <table class="dev" id="devTable" style="display:none">
-    <thead><tr><th style="width:44px"></th><th>Order</th><th>Host</th><th>Endpoint</th><th>Free / Total VRAM</th></tr></thead>
+    <thead><tr><th style="width:44px"></th><th>Order</th><th>Host</th><th>Endpoint</th><th>Capacity (free / total)</th></tr></thead>
     <tbody id="devBody"></tbody>
   </table>
   <div id="devEmpty" class="muted" style="margin-top:8px">No nodes discovered yet. This machine will run the whole model locally if you launch without any.</div>
@@ -94,6 +115,15 @@
     <button id="btnRefreshModels">Refresh</button>
   </div>
   <div id="splitPreview"></div>
+
+  <label style="margin-top:16px">Download from Hugging Face</label>
+  <div class="row">
+    <input type="text" id="hfRepo" class="grow" placeholder="e.g. ggml-org/gemma-3-4b-it-qat-GGUF or repo:QUANT">
+    <input type="text" id="hfFile" placeholder="file (optional)" style="width:160px">
+    <button id="btnDownload">Download</button>
+  </div>
+  <span id="downloadStatus" class="status muted"></span>
+  <div id="downloadOutput" class="out" style="display:none"></div>
 </div>
 
 <h2>3. Prompt</h2>
@@ -114,6 +144,22 @@
   <div id="output" class="out" style="display:none"></div>
 </div>
 
+<h2>5. U-Shaped Pipeline (gRPC)</h2>
+<div class="panel">
+  <p class="sub" style="color:var(--muted);margin-top:0">Keeps the head (first layers) and tail
+  (last layers + sampling) on <b>this</b> machine; only the middle "trunk" range is delegated to
+  the nodes above via real Hello/AssignLayers/PassOff gRPC calls. One forward pass (one sampled
+  token), not full generation yet.</p>
+  <div class="row">
+    <label style="margin:0">Head layers <input type="number" id="headLayers" value="1" min="1" style="width:70px"></label>
+    <label style="margin:0">Tail layers <input type="number" id="tailLayers" value="1" min="1" style="width:70px"></label>
+    <button id="btnLaunchGrpc" class="primary">Launch via gRPC pipeline</button>
+  </div>
+  <div id="uPlanPreview"></div>
+  <span id="grpcStatus" class="status muted"></span>
+  <div id="grpcOutput" class="out" style="display:none"></div>
+</div>
+
 <footer>
   llama-cluster-ui - part of the distributed-rpc prototype. Binds to 127.0.0.1 by default; do
   not expose this to an untrusted network - it can launch processes with no authentication.
@@ -124,7 +170,46 @@
 <script>
 "use strict";
 
-const COLORS = ["#6ab7ff","#c792ea","#f6c177","#57d38c","#ff9e9e","#7fd6c4","#e0a3ff","#b7c46a"];
+// Validated categorical palette (dataviz skill: dark-mode steps, fixed order - never cycled by
+// rank). Passes CVD/contrast checks against this page's actual panel surface.
+const SPLIT_COLORS = ["#3987e5","#199e70","#c98500","#008300","#9085e9","#e66767","#d55181","#d95926"];
+const HEAD_TAIL_COLOR = "#52514e"; // neutral - "this machine", not a selectable/orderable peer
+
+// Stable per-node color keyed by endpoint identity, not array position - so reordering nodes
+// (the up/down buttons) never repaints who's already there. Color follows the entity, not rank.
+function colorForEndpoint(endpoint) {
+  let hash = 0;
+  for (let i = 0; i < endpoint.length; i++) {
+    hash = (hash * 31 + endpoint.charCodeAt(i)) >>> 0;
+  }
+  return SPLIT_COLORS[hash % SPLIT_COLORS.length];
+}
+
+// Shared part-to-whole visualization for "how the model's layers are split" - one component
+// used by both the plain-launch illustrative preview and the real gRPC U-shape plan, so the two
+// don't look and behave like unrelated widgets. Renders a gapped segmented bar plus a persistent
+// legend (identity never relies on hover alone) with layer counts + percentages.
+function segmentedBarHtml(segments, totalLayers) {
+  if (!segments.length || !totalLayers) {
+    return "";
+  }
+
+  const bar = segments.map(s => {
+    const frac = s.layers / totalLayers;
+    const pct = (frac * 100).toFixed(2);
+    // measure first, don't clip: only place the count inside a segment if it's wide enough to
+    // hold it comfortably, otherwise the legend below already carries the same number.
+    const showInline = frac > 0.06;
+    return `<div class="seg" style="width:${pct}%;background:${s.color}" title="${s.label}: ${s.layers} layer(s) (${(frac * 100).toFixed(0)}%)">${showInline ? s.layers : ""}</div>`;
+  }).join("");
+
+  const legend = segments.map(s => {
+    const pct = (s.layers / totalLayers * 100).toFixed(0);
+    return `<div class="legend-item"><span class="swatch" style="background:${s.color}"></span>${s.label}<span class="lcount">${s.layers}L &middot; ${pct}%</span></div>`;
+  }).join("");
+
+  return `<div class="bar">${bar}</div><div class="legend">${legend}</div>`;
+}
 const GIB = 2 ** 30;
 const $ = id => document.getElementById(id);
 
@@ -169,18 +254,25 @@ function renderNodes() {
 
   nodes.forEach((n, i) => {
     const tr = document.createElement("tr");
-    const freeGiB = (n.free_bytes / GIB).toFixed(1);
+    const freeGiB  = (n.free_bytes / GIB).toFixed(1);
     const totalGiB = (n.total_bytes / GIB).toFixed(1);
+    const usedPct  = n.total_bytes > 0 ? Math.min(100, (1 - n.free_bytes / n.total_bytes) * 100) : 0;
+    const color    = colorForEndpoint(n.endpoint);
 
     tr.innerHTML = `
-      <td><span class="swatch" style="background:${COLORS[i % COLORS.length]}"></span></td>
+      <td><span class="swatch" style="background:${color}"></span></td>
       <td class="ord">
         <button data-dir="up" data-i="${i}" ${i === 0 ? "disabled" : ""}>&uarr;</button>
         <button data-dir="down" data-i="${i}" ${i === nodes.length - 1 ? "disabled" : ""}>&darr;</button>
       </td>
       <td>${n.hostname}</td>
       <td style="font-family:var(--mono)">${n.endpoint}</td>
-      <td style="font-family:var(--mono)">${freeGiB} / ${totalGiB} GiB</td>
+      <td>
+        <div class="meter-cell">
+          <div class="meter-track"><div class="meter-fill" style="width:${usedPct.toFixed(1)}%"></div></div>
+          <span class="meter-label">${freeGiB} / ${totalGiB} GiB free</span>
+        </div>
+      </td>
     `;
     body.appendChild(tr);
   });
@@ -197,6 +289,32 @@ function renderNodes() {
 }
 
 // ---- models ----
+let downloadedModels = []; // models fetched via the HF download panel this session
+
+function modelOptionLabel(m) {
+  const suffix = m.n_layers ? ` (${m.n_layers} layers, ${(m.size_bytes / GIB).toFixed(2)} GiB)` : "";
+  return (m.downloaded ? "[downloaded] " : "") + m.name + suffix;
+}
+
+function renderModelSelect(selectPath) {
+  const sel = $("modelSelect");
+  const combined = [...downloadedModels, ...models];
+  const keep = selectPath || sel.value;
+
+  if (combined.length === 0) {
+    sel.innerHTML = `<option value="">(no .gguf files found - set MODELS_DIR, or download one above)</option>`;
+    return;
+  }
+
+  sel.innerHTML = combined.map(m =>
+    `<option value="${m.path}">${modelOptionLabel(m)}</option>`
+  ).join("");
+
+  if (keep && combined.some(m => m.path === keep)) {
+    sel.value = keep;
+  }
+}
+
 async function loadModels() {
   const sel = $("modelSelect");
   sel.innerHTML = `<option value="">(loading models...)</option>`;
@@ -204,13 +322,7 @@ async function loadModels() {
     const res = await fetch("/api/models");
     if (!res.ok) throw new Error("HTTP " + res.status);
     models = await res.json();
-    if (models.length === 0) {
-      sel.innerHTML = `<option value="">(no .gguf files found - set MODELS_DIR)</option>`;
-      return;
-    }
-    sel.innerHTML = models.map(m =>
-      `<option value="${m.path}">${m.name}${m.n_layers ? ` (${m.n_layers} layers, ${(m.size_bytes / GIB).toFixed(2)} GiB)` : ""}</option>`
-    ).join("");
+    renderModelSelect();
   } catch (e) {
     sel.innerHTML = `<option value="">(failed to load models: ${e.message})</option>`;
   }
@@ -219,7 +331,90 @@ async function loadModels() {
 
 function selectedModel() {
   const path = $("modelSelect").value;
-  return models.find(m => m.path === path) || null;
+  return [...downloadedModels, ...models].find(m => m.path === path) || null;
+}
+
+// ---- download from Hugging Face ----
+async function downloadModel() {
+  const hfRepo = $("hfRepo").value.trim();
+  const hfFile = $("hfFile").value.trim();
+  if (!hfRepo) {
+    $("downloadStatus").textContent = "enter a HF repo first";
+    $("downloadStatus").className = "status err";
+    return;
+  }
+
+  $("btnDownload").disabled = true;
+  $("downloadStatus").textContent = "starting download...";
+  $("downloadStatus").className = "status muted";
+  $("downloadOutput").style.display = "block";
+  $("downloadOutput").textContent = "";
+
+  try {
+    const res = await fetch("/api/models/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hf_repo: hfRepo, hf_file: hfFile }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+
+    $("downloadStatus").textContent = "downloading (run " + data.run_id + ")...";
+    $("downloadStatus").className = "status muted";
+    await pollDownload(data.run_id);
+  } catch (e) {
+    $("downloadStatus").textContent = "download failed: " + e.message;
+    $("downloadStatus").className = "status err";
+    $("btnDownload").disabled = false;
+  }
+}
+
+async function pollDownload(runId) {
+  const res = await fetch(`/api/runs/${runId}`);
+  const data = await res.json();
+  $("downloadOutput").textContent = data.output;
+  $("downloadOutput").scrollTop = $("downloadOutput").scrollHeight;
+
+  if (data.running) {
+    setTimeout(() => pollDownload(runId), 1000);
+    return;
+  }
+
+  $("btnDownload").disabled = false;
+
+  if (data.exit_code !== 0) {
+    $("downloadStatus").textContent = `download failed (exit code ${data.exit_code})`;
+    $("downloadStatus").className = "status err";
+    return;
+  }
+
+  // `llama download` prints the resolved local path(s) as the last line(s) of stdout on success.
+  const lines = data.output.trim().split("\n").map(l => l.trim()).filter(Boolean);
+  const modelPath = lines[lines.length - 1];
+  if (!modelPath) {
+    $("downloadStatus").textContent = "download finished but no path was returned";
+    $("downloadStatus").className = "status err";
+    return;
+  }
+
+  let entry = { name: modelPath.split("/").pop(), path: modelPath, downloaded: true };
+  try {
+    const metaRes = await fetch("/api/model-meta?path=" + encodeURIComponent(modelPath));
+    if (metaRes.ok) {
+      const meta = await metaRes.json();
+      entry = { ...entry, arch: meta.arch, n_layers: meta.n_layers, size_bytes: meta.size_bytes };
+    }
+  } catch (e) {
+    // metadata is a nice-to-have for the split preview; a failed lookup shouldn't block using the model
+  }
+
+  downloadedModels = downloadedModels.filter(m => m.path !== entry.path);
+  downloadedModels.unshift(entry);
+  renderModelSelect(entry.path);
+  renderSplitPreview();
+
+  $("downloadStatus").textContent = "downloaded and selected: " + entry.name;
+  $("downloadStatus").className = "status ok";
 }
 
 // ---- illustrative layer-split preview (client-side only, does not affect the actual launch -
@@ -240,13 +435,13 @@ function renderSplitPreview() {
   const order = quotas.map((q, i) => i).sort((a, b) => (quotas[b] - counts[b]) - (quotas[a] - counts[a]));
   for (let k = 0; k < need; k++) counts[order[k]] += 1;
 
-  const bar = counts.map((c, i) => {
-    if (c === 0) return "";
-    const pct = (c / model.n_layers) * 100;
-    return `<div class="seg" style="width:${pct}%;background:${COLORS[i % COLORS.length]}" title="${nodes[i].hostname}: ${c} layers">${c}</div>`;
-  }).join("");
+  const segments = nodes
+    .map((n, i) => ({ label: n.hostname, layers: counts[i], color: colorForEndpoint(n.endpoint) }))
+    .filter(s => s.layers > 0);
 
-  box.innerHTML = `<div class="muted" style="font-size:12px;margin-top:10px">illustrative layer split preview (proportional to free VRAM) - the real split is decided by llama-cli itself</div><div class="bar">${bar}</div>`;
+  box.innerHTML =
+    `<div class="muted" style="font-size:12px;margin:10px 0 4px">Illustrative - proportional to free memory. The real split for a plain Launch is decided by llama-cli itself.</div>` +
+    segmentedBarHtml(segments, model.n_layers);
 }
 
 // ---- launch / poll / stop ----
@@ -264,6 +459,12 @@ async function launch() {
   $("output").style.display = "block";
   $("output").textContent = "";
 
+  // clamp to the input's own declared range - parseInt alone doesn't enforce min/max, and the
+  // server rejects out-of-range values anyway, but failing fast here gives instant feedback
+  // instead of a round-trip.
+  const nPredictRaw = parseInt($("nPredict").value, 10);
+  const nPredict = Number.isFinite(nPredictRaw) ? Math.min(4096, Math.max(1, nPredictRaw)) : 32;
+
   try {
     const res = await fetch("/api/launch", {
       method: "POST",
@@ -271,7 +472,7 @@ async function launch() {
       body: JSON.stringify({
         model_path: model.path,
         prompt: $("prompt").value,
-        n_predict: parseInt($("nPredict").value, 10) || 32,
+        n_predict: nPredict,
         nodes: nodes.map(n => ({ endpoint: n.endpoint })),
       }),
     });
@@ -318,11 +519,112 @@ async function stop() {
   $("btnStop").disabled = true;
 }
 
+// ---- U-shaped gRPC pipeline ----
+// Splits only the *trunk* range [headLayers, n_layers - tailLayers) proportionally across the
+// discovered/ordered nodes above (same largest-remainder method as renderSplitPreview, applied
+// to a sub-range instead of the whole model). Returns null (and updates uPlanPreview with the
+// reason) if the current head/tail/node selection can't produce a valid contiguous plan.
+function computeUShapePlan(model, headLayers, tailLayers) {
+  const box = $("uPlanPreview");
+  const trunkLayers = model.n_layers - headLayers - tailLayers;
+
+  if (trunkLayers < 0) {
+    box.innerHTML = `<div class="errbox">head_layers + tail_layers (${headLayers + tailLayers}) exceeds this model's ${model.n_layers} layers</div>`;
+    return null;
+  }
+  if (trunkLayers > 0 && nodes.length === 0) {
+    box.innerHTML = `<div class="errbox">${trunkLayers} trunk layer(s) need at least one discovered node - discover nodes above, or increase head/tail layers to cover the whole model locally</div>`;
+    return null;
+  }
+
+  const trunk = [];
+  const trunkSegments = [];
+  if (trunkLayers > 0) {
+    const usable = nodes.map(n => Math.max(n.free_bytes, 1));
+    const total = usable.reduce((a, b) => a + b, 0);
+    const quotas = usable.map(u => u / total * trunkLayers);
+    const counts = quotas.map(q => Math.floor(q));
+    const need = trunkLayers - counts.reduce((a, b) => a + b, 0);
+    const order = quotas.map((q, i) => i).sort((a, b) => (quotas[b] - counts[b]) - (quotas[a] - counts[a]));
+    for (let k = 0; k < need; k++) counts[order[k]] += 1;
+
+    let start = headLayers;
+    for (let i = 0; i < nodes.length; i++) {
+      if (counts[i] === 0) continue;
+      trunk.push({ endpoint: nodes[i].endpoint, layer_start: start, layer_end: start + counts[i] });
+      trunkSegments.push({ label: nodes[i].hostname, layers: counts[i], color: colorForEndpoint(nodes[i].endpoint) });
+      start += counts[i];
+    }
+  }
+
+  const segments = [
+    { label: "this machine (head)", layers: headLayers, color: HEAD_TAIL_COLOR },
+    ...trunkSegments,
+    { label: "this machine (tail)", layers: tailLayers, color: HEAD_TAIL_COLOR },
+  ];
+  box.innerHTML = segmentedBarHtml(segments, model.n_layers);
+
+  return { head_layers: headLayers, tail_layers: tailLayers, trunk };
+}
+
+async function launchGrpc() {
+  const model = selectedModel();
+  if (!model || !model.n_layers) {
+    $("grpcStatus").textContent = "pick a model with known layer count first";
+    $("grpcStatus").className = "status err";
+    return;
+  }
+
+  const headLayers = Math.max(1, parseInt($("headLayers").value, 10) || 1);
+  const tailLayers = Math.max(1, parseInt($("tailLayers").value, 10) || 1);
+  const plan = computeUShapePlan(model, headLayers, tailLayers);
+  if (!plan) {
+    $("grpcStatus").textContent = "fix the plan above before launching";
+    $("grpcStatus").className = "status err";
+    return;
+  }
+
+  $("btnLaunchGrpc").disabled = true;
+  $("grpcStatus").textContent = "running pipeline...";
+  $("grpcStatus").className = "status muted";
+  $("grpcOutput").style.display = "block";
+  $("grpcOutput").textContent = "";
+
+  try {
+    const res = await fetch("/api/launch-grpc", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model_path: model.path,
+        prompt: $("prompt").value,
+        head_layers: plan.head_layers,
+        tail_layers: plan.tail_layers,
+        trunk: plan.trunk,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+
+    $("grpcOutput").textContent = `token=${data.token}  piece=${JSON.stringify(data.piece)}  is_eog=${data.is_eog}`;
+    $("grpcStatus").textContent = "done";
+    $("grpcStatus").className = "status ok";
+  } catch (e) {
+    $("grpcStatus").textContent = "pipeline failed: " + e.message;
+    $("grpcStatus").className = "status err";
+  } finally {
+    $("btnLaunchGrpc").disabled = false;
+  }
+}
+
 $("btnDiscover").onclick = discover;
 $("btnRefreshModels").onclick = loadModels;
+$("btnDownload").onclick = downloadModel;
 $("btnLaunch").onclick = launch;
 $("btnStop").onclick = stop;
+$("btnLaunchGrpc").onclick = launchGrpc;
 $("modelSelect").onchange = renderSplitPreview;
+$("headLayers").onchange = () => { const m = selectedModel(); if (m && m.n_layers) computeUShapePlan(m, Math.max(1, parseInt($("headLayers").value, 10) || 1), Math.max(1, parseInt($("tailLayers").value, 10) || 1)); };
+$("tailLayers").onchange = $("headLayers").onchange;
 
 loadModels();
 </script>

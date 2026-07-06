@@ -38,6 +38,14 @@ service ClusterNode {
   // in chunks (kept as a stream rather than one big unary call so this scales to larger
   // hidden-state tensors without a single oversized message).
   rpc PassOff(stream PassOffChunk) returns (PassOffAck);
+
+  // Coordinator -> node: model provisioning. AssignLayers assumes the model is already on disk;
+  // these two let the coordinator ensure that first, without every friend having to manually
+  // pre-place model files. Async, same start+poll shape as PassOff's non-streaming siblings:
+  // DownloadModel starts the download and returns immediately with a download_id,
+  // GetDownloadStatus polls it.
+  rpc DownloadModel(DownloadModelRequest) returns (DownloadModelResponse);
+  rpc GetDownloadStatus(GetDownloadStatusRequest) returns (GetDownloadStatusResponse);
 }
 
 message NodeCapabilities {
@@ -123,4 +131,36 @@ message PassOffChunk {
 message PassOffAck {
   bool   ok    = 1;
   string error = 2;
+}
+
+// Same source (Hugging Face, via `llama download -hf <repo>[:tag]`) the existing HTTP
+// /api/models/download endpoint already uses on the origin node - this is that same mechanism,
+// callable on a remote node instead.
+message DownloadModelRequest {
+  string hf_repo = 1; // e.g. "ggml-org/Qwen3-0.6B-GGUF" or "repo:QUANT"
+  string hf_file = 2; // optional - exact filename within the repo
+}
+
+message DownloadModelResponse {
+  bool   accepted      = 1;
+  string download_id   = 2; // opaque id to poll via GetDownloadStatus; set iff accepted
+  string reject_reason = 3; // set iff !accepted
+}
+
+enum DownloadState {
+  DOWNLOAD_STATE_UNKNOWN = 0;
+  DOWNLOAD_STATE_RUNNING = 1;
+  DOWNLOAD_STATE_DONE    = 2;
+  DOWNLOAD_STATE_FAILED  = 3;
+}
+
+message GetDownloadStatusRequest {
+  string download_id = 1;
+}
+
+message GetDownloadStatusResponse {
+  DownloadState state       = 1;
+  string        model_path  = 2; // populated once state == DOWNLOAD_STATE_DONE
+  string        error       = 3; // populated once state == DOWNLOAD_STATE_FAILED
+  string        output_tail = 4; // trailing slice of subprocess output, for progress visibility
 }
