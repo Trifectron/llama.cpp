@@ -5,15 +5,32 @@
 
 #include <nlohmann/json.hpp>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#else
+#  include <arpa/inet.h>
+#  include <fcntl.h>
+#  include <netinet/in.h>
+#  include <sys/select.h>
+#  include <sys/socket.h>
+#  include <unistd.h>
+#endif
 
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+
+#ifdef _WIN32
+typedef SOCKET sockfd_t;
+#else
+typedef int sockfd_t;
+#endif
 
 using json = nlohmann::json;
 
@@ -29,7 +46,11 @@ struct tailscale_peer {
 // running) - that's a hard error. An empty peer list (no peers on the tailnet yet) is not an
 // error, just an empty result.
 bool list_online_tailscale_peers(std::vector<tailscale_peer> & out_peers, std::string & out_error) {
+#ifdef _WIN32
+    FILE * pipe = _popen("tailscale status --json 2>nul", "r");
+#else
     FILE * pipe = popen("tailscale status --json 2>/dev/null", "r");
+#endif
     if (pipe == NULL) {
         out_error = "failed to run 'tailscale status --json' (is tailscale installed and in PATH?)";
         return false;
@@ -41,7 +62,11 @@ bool list_online_tailscale_peers(std::vector<tailscale_peer> & out_peers, std::s
     while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0) {
         output.append(buf, n);
     }
+#ifdef _WIN32
+    const int rc = _pclose(pipe);
+#else
     const int rc = pclose(pipe);
+#endif
     if (rc != 0 || output.empty()) {
         out_error = "'tailscale status --json' failed (is the tailscaled daemon running and are you logged in?)";
         return false;
@@ -83,20 +108,41 @@ bool list_online_tailscale_peers(std::vector<tailscale_peer> & out_peers, std::s
 // (and its own internal timeout behavior) for peers that are online in Tailscale but simply
 // don't have a ggml-rpc-server running.
 bool tcp_port_open(const std::string & ip, int port, int timeout_ms) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+#ifdef _WIN32
+    // one-time winsock init; refcounted by the OS, so it coexists with ggml-rpc's own WSAStartup
+    static std::once_flag wsa_once;
+    std::call_once(wsa_once, []() {
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+    });
+
+    sockfd_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKET) {
+        return false;
+    }
+
+    u_long nonblock = 1;
+    ioctlsocket(fd, FIONBIO, &nonblock);
+#else
+    sockfd_t fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return false;
     }
 
     const int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port   = htons((uint16_t) port);
     if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+#ifdef _WIN32
+        closesocket(fd);
+#else
         close(fd);
+#endif
         return false;
     }
 
@@ -104,7 +150,11 @@ bool tcp_port_open(const std::string & ip, int port, int timeout_ms) {
     const int rc = connect(fd, (struct sockaddr *) &addr, sizeof(addr));
     if (rc == 0) {
         ok = true;
+#ifdef _WIN32
+    } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+#else
     } else if (errno == EINPROGRESS) {
+#endif
         fd_set wfds;
         FD_ZERO(&wfds);
         FD_SET(fd, &wfds);
@@ -113,16 +163,25 @@ bool tcp_port_open(const std::string & ip, int port, int timeout_ms) {
         tv.tv_sec  = timeout_ms / 1000;
         tv.tv_usec = (timeout_ms % 1000) * 1000;
 
-        if (select(fd + 1, NULL, &wfds, NULL, &tv) > 0) {
-            int       err     = 0;
+        // first select() arg is ignored on Windows
+        if (select((int) fd + 1, NULL, &wfds, NULL, &tv) > 0) {
+            int err = 0;
+#ifdef _WIN32
+            int err_len = sizeof(err);
+#else
             socklen_t err_len = sizeof(err);
-            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len) == 0 && err == 0) {
+#endif
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *) &err, &err_len) == 0 && err == 0) {
                 ok = true;
             }
         }
     }
 
+#ifdef _WIN32
+    closesocket(fd);
+#else
     close(fd);
+#endif
     return ok;
 }
 

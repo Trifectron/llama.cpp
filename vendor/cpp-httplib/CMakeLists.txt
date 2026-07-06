@@ -9,6 +9,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_library(${TARGET} STATIC httplib.cpp httplib.h)
 
+if (WIN32)
+    # mingw-w64 headers may default _WIN32_WINNT to pre-Windows-10; httplib.h requires 0x0A00.
+    # PUBLIC so every consumer that includes httplib.h compiles with the same API level.
+    target_compile_definitions(${TARGET} PUBLIC _WIN32_WINNT=0x0A00)
+endif()
+
 # disable warnings in 3rd party code
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     target_compile_options(${TARGET} PRIVATE /w)

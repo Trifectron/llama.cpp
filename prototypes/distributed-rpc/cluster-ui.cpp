@@ -16,11 +16,20 @@
 #include <cpp-httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#else
+#  include <sys/wait.h>
+#  include <fcntl.h>
+#  include <signal.h>
+#  include <unistd.h>
+#endif
+
 #include <sys/stat.h>
-#include <sys/wait.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <unistd.h>
 #include <dirent.h>
 
 #include <cstdio>
@@ -35,7 +44,9 @@
 
 using json = nlohmann::json;
 
+#ifndef _WIN32
 extern char ** environ;
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // GGUF header reader - C++ port of the reference teaching artifact's read_gguf_meta(): walks
@@ -168,7 +179,17 @@ static bool read_gguf_meta(const std::string & path, gguf_meta & out) {
 // ---------------------------------------------------------------------------------------------
 
 struct run_state {
+#ifdef _WIN32
+    HANDLE      process = NULL;
+
+    ~run_state() {
+        if (process) {
+            CloseHandle(process);
+        }
+    }
+#else
     pid_t       pid     = -1;
+#endif
     std::mutex  mtx;
     std::string output;
     bool        running = true;
@@ -185,10 +206,130 @@ static int                                            g_next_run_id = 1;
 // invoked (build-rpc/bin/...).
 static std::string sibling_binary_path(const char * self_argv0, const char * name) {
     std::string self(self_argv0);
+#ifdef _WIN32
+    const size_t slash = self.find_last_of("/\\");
+    const std::string dir = (slash == std::string::npos) ? "." : self.substr(0, slash);
+    // CreateProcess requires an explicit extension in the application name
+    return dir + "\\" + name + ".exe";
+#else
     const size_t slash = self.find_last_of('/');
     const std::string dir = (slash == std::string::npos) ? "." : self.substr(0, slash);
     return dir + "/" + name;
+#endif
 }
+
+#ifdef _WIN32
+
+// Quotes one argv entry per CommandLineToArgvW's rules: backslashes are literal unless they
+// precede a double quote, in which case they (and the quote) must be escaped.
+static std::string win_quote_arg(const std::string & arg) {
+    if (!arg.empty() && arg.find_first_of(" \t\"") == std::string::npos) {
+        return arg;
+    }
+    std::string out = "\"";
+    size_t n_backslash = 0;
+    for (const char c : arg) {
+        if (c == '\\') {
+            n_backslash++;
+            continue;
+        }
+        if (c == '"') {
+            out.append(n_backslash * 2 + 1, '\\');
+        } else {
+            out.append(n_backslash, '\\');
+        }
+        out += c;
+        n_backslash = 0;
+    }
+    out.append(n_backslash * 2, '\\');
+    out += '"';
+    return out;
+}
+
+static std::shared_ptr<run_state> launch_process(const std::vector<std::string> & argv_strs) {
+    auto state = std::make_shared<run_state>();
+
+    SECURITY_ATTRIBUTES sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.nLength        = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE pipe_rd = NULL;
+    HANDLE pipe_wr = NULL;
+    if (!CreatePipe(&pipe_rd, &pipe_wr, &sa, 0)) {
+        state->running   = false;
+        state->exit_code = -1;
+        state->output    = "error: CreatePipe() failed\n";
+        return state;
+    }
+    // only the write end may be inherited by the child
+    SetHandleInformation(pipe_rd, HANDLE_FLAG_INHERIT, 0);
+
+    // never let the child block waiting for interactive input - it has no terminal here.
+    HANDLE devnull = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                                 OPEN_EXISTING, 0, NULL);
+
+    std::string cmdline;
+    for (const auto & s : argv_strs) {
+        if (!cmdline.empty()) {
+            cmdline += ' ';
+        }
+        cmdline += win_quote_arg(s);
+    }
+    std::vector<char> cmdline_buf(cmdline.begin(), cmdline.end());
+    cmdline_buf.push_back('\0');
+
+    STARTUPINFOA si;
+    memset(&si, 0, sizeof(si));
+    si.cb         = sizeof(si);
+    si.dwFlags    = STARTF_USESTDHANDLES;
+    si.hStdInput  = devnull;
+    si.hStdOutput = pipe_wr;
+    si.hStdError  = pipe_wr;
+
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof(pi));
+
+    const BOOL ok = CreateProcessA(argv_strs[0].c_str(), cmdline_buf.data(), NULL, NULL,
+                                   TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    CloseHandle(pipe_wr);
+    if (devnull != INVALID_HANDLE_VALUE) {
+        CloseHandle(devnull);
+    }
+    if (!ok) {
+        CloseHandle(pipe_rd);
+        state->running   = false;
+        state->exit_code = -1;
+        state->output    = "error: CreateProcess(" + argv_strs[0] + ") failed\n";
+        return state;
+    }
+    CloseHandle(pi.hThread);
+    state->process = pi.hProcess;
+
+    std::thread reader([state, pipe_rd]() {
+        char  buf[4096];
+        DWORD n = 0;
+        // ReadFile fails with ERROR_BROKEN_PIPE once the child exits and the pipe drains
+        while (ReadFile(pipe_rd, buf, sizeof(buf), &n, NULL) && n > 0) {
+            std::lock_guard<std::mutex> lock(state->mtx);
+            state->output.append(buf, (size_t) n);
+        }
+        CloseHandle(pipe_rd);
+
+        WaitForSingleObject(state->process, INFINITE);
+        DWORD code = (DWORD) -1;
+        GetExitCodeProcess(state->process, &code);
+
+        std::lock_guard<std::mutex> lock(state->mtx);
+        state->running   = false;
+        state->exit_code = (int) code;
+    });
+    reader.detach();
+
+    return state;
+}
+
+#else
 
 static std::shared_ptr<run_state> launch_process(const std::vector<std::string> & argv_strs) {
     auto state = std::make_shared<run_state>();
@@ -262,6 +403,8 @@ static std::shared_ptr<run_state> launch_process(const std::vector<std::string> 
 
     return state;
 }
+
+#endif // _WIN32
 
 // ---------------------------------------------------------------------------------------------
 // main
@@ -454,9 +597,15 @@ int main(int argc, char ** argv) {
             state = it->second;
         }
 
+#ifdef _WIN32
+        if (state->process) {
+            TerminateProcess(state->process, 1);
+        }
+#else
         if (state->pid > 0) {
             kill(state->pid, SIGTERM);
         }
+#endif
         res.set_content(json{{"ok", true}}.dump(), "application/json");
     });
 
