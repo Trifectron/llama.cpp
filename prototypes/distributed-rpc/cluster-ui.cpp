@@ -808,29 +808,58 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        // 4. Hand off to the first trunk node (or straight back to this node's own tail if no
-        //    trunk nodes were selected - a degenerate but valid all-local U "split").
+        // 4. Generation loop. Each lap sends the current hidden state around the U (trunk chain ->
+        //    this node's tail), samples one token, then feeds that token back through the local
+        //    head to produce the next lap's hidden state. Every node's context (head, trunks, tail)
+        //    keeps its KV cache across laps, so lap 0 processes the whole prompt and every lap after
+        //    decodes just the single new token - the point of KV-cache persistence.
         const std::string first_hop = trunk.empty() ? self_endpoint : trunk.front().endpoint;
-        std::string pass_off_error;
-        if (!cluster_grpc_send_pass_off(first_hop, request_id, hidden, pass_off_error)) {
-            res.status = 502;
-            res.set_content(json{{"error", "initial PassOff to " + first_hop + " failed: " + pass_off_error}}.dump(), "application/json");
-            return;
+        const int32_t     n_prompt  = hidden.n_tokens;      // prompt occupied positions [0, n_prompt)
+        const int         max_tokens = std::max(1, (int) body.value("max_tokens", (int64_t) 128));
+
+        std::string         generated;
+        int32_t             next_pos = n_prompt;            // next token lands here
+        cluster_tail_result result;
+        bool                hit_eog  = false;
+
+        for (int step = 0; step < max_tokens; ++step) {
+            std::string pass_off_error;
+            if (!cluster_grpc_send_pass_off(first_hop, request_id, hidden, pass_off_error)) {
+                g_cluster_node.finish_request(request_id);
+                res.status = 502;
+                res.set_content(json{{"error", "PassOff to " + first_hop + " failed: " + pass_off_error}}.dump(), "application/json");
+                return;
+            }
+
+            std::string wait_error;
+            if (!g_cluster_node.wait_for_tail_result(request_id, /*timeout_ms=*/30000, result, wait_error)) {
+                g_cluster_node.finish_request(request_id);
+                res.status = 504;
+                res.set_content(json{{"error", "pipeline did not complete at token " + std::to_string(step) + ": " + wait_error}}.dump(), "application/json");
+                return;
+            }
+
+            generated += result.piece;
+            if (result.is_eog) { hit_eog = true; break; }
+
+            // Feed the sampled token back through the local head for the next lap (single-token
+            // decode reusing the head's persisted KV cache).
+            std::string head_step_error;
+            if (!head_runner.run_head_token(result.token, next_pos, hidden, head_step_error)) {
+                g_cluster_node.finish_request(request_id);
+                res.status = 500;
+                res.set_content(json{{"error", "head decode-step failed at token " + std::to_string(step) + ": " + head_step_error}}.dump(), "application/json");
+                return;
+            }
+            ++next_pos;
         }
 
-        // 5. Wait for the tail (this node's own PassOff handler) to complete the request.
-        cluster_tail_result result;
-        std::string wait_error;
-        if (!g_cluster_node.wait_for_tail_result(request_id, /*timeout_ms=*/30000, result, wait_error)) {
-            res.status = 504;
-            res.set_content(json{{"error", "pipeline did not complete: " + wait_error}}.dump(), "application/json");
-            return;
-        }
+        g_cluster_node.finish_request(request_id);
 
         res.set_content(json{
-            {"token",   result.token},
-            {"piece",   result.piece},
-            {"is_eog",  result.is_eog},
+            {"text",         generated},
+            {"n_generated",  next_pos - n_prompt + (hit_eog ? 1 : 0)},
+            {"stop_reason",  hit_eog ? "eog" : "length"},
         }.dump(), "application/json");
     });
 

@@ -223,11 +223,6 @@ bool cluster_node_service::wait_for_tail_result(const std::string & request_id, 
     const bool signaled = req->result_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
                                                     [&] { return req->done; });
 
-    {
-        std::lock_guard<std::mutex> cleanup_lock(requests_mtx_);
-        requests_.erase(request_id);
-    }
-
     if (!signaled) {
         out_error = "timed out waiting for tail result";
         return false;
@@ -238,7 +233,14 @@ bool cluster_node_service::wait_for_tail_result(const std::string & request_id, 
     }
 
     out = req->tail_result;
+    req->done = false; // re-arm for the next generation lap; the loop is serial (no PassOff is in
+                       // flight between reading here and sending the next one), so this is safe.
     return true;
+}
+
+void cluster_node_service::finish_request(const std::string & request_id) {
+    std::lock_guard<std::mutex> lock(requests_mtx_);
+    requests_.erase(request_id);
 }
 
 void cluster_node_service::handle_hidden_state(const std::shared_ptr<pending_request> & req, const cluster_hidden_state & in) {

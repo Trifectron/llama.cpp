@@ -58,6 +58,12 @@ public:
     // narrowly head-shaped, matching split-tap's own head/tail split.
     bool run_head(const std::string & prompt, cluster_hidden_state & out, std::string & out_error);
 
+    // Head only, laps > 0: feeds a single already-sampled token at `position` through layers
+    // [0, il_end), reusing the head's persisted KV cache from run_head()/prior steps, and returns
+    // the 1-token boundary hidden state. This is the autoregressive step; run_head() bootstraps it
+    // by processing the prompt into KV first.
+    bool run_head_token(llama_token token, int32_t position, cluster_hidden_state & out, std::string & out_error);
+
     // Non-head, non-tail (0 < il_start, il_end < n_layer): feeds an incoming hidden state as this
     // context's layer-0 input, decodes [il_start, il_end), returns the new boundary hidden state.
     bool run_trunk(const cluster_hidden_state & in, cluster_hidden_state & out, std::string & out_error);

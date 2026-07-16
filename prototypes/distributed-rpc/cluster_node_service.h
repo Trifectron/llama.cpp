@@ -49,9 +49,17 @@ public:
 
     // Blocks up to timeout_ms for PassOff to complete the tail runner registered under
     // request_id (whether that runner was registered via a remote AssignLayers or via
-    // register_local_runner()). Used by the origin's launch handler to get the final answer.
+    // register_local_runner()). Used by the origin's launch handler to get one generated token.
+    // Re-arms the request for the next generation lap on success (does NOT erase it), so the loop
+    // can wait again after feeding the sampled token back through the head - call finish_request()
+    // once generation is done.
     bool wait_for_tail_result(const std::string & request_id, int timeout_ms,
                                cluster_tail_result & out, std::string & out_error);
+
+    // Drops the request (and its runner + KV cache) once the generation loop ends. Origin only,
+    // for the local tail it registered. ponytail: trunk nodes' runners still leak per request
+    // (pre-existing - no cleanup RPC yet); add a ClusterNode.Cleanup RPC if long-lived nodes OOM.
+    void finish_request(const std::string & request_id);
 
 private:
     struct pending_request {
