@@ -1299,6 +1299,38 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
 
+    // -ot/--override-tensor can place a layer's weights on a device the monotonic split above would
+    // never pick (e.g. a non-contiguous "U" with the middle layers on an RPC node). dev_layer drives
+    // KV cache placement (llama-kv-cache.cpp) and the flash-attn device check (llama-context.cpp), so
+    // it has to follow the *attention* weights - otherwise the KV cache is allocated on the wrong
+    // device and FA is silently disabled on a device mismatch.
+    //
+    // Probe attn_k specifically rather than any tensor in the layer: this deliberately leaves the
+    // common MoE offload case (-ot "ffn_.*_exps=CPU") pointing at its original device, which is
+    // correct - KV should follow attention, not the FFN.
+    //
+    // Only .dev is corrected, never .buft_list: the loader applies the overrides per-tensor itself,
+    // and rewriting the fallback list here would drag the *un*-overridden tensors of a partially
+    // overridden layer onto the new device along with it.
+    if (params.tensor_buft_overrides) {
+        const auto tn = LLM_TN(arch);
+        for (int il = 0; il < n_layer_all; ++il) {
+            const std::string name = tn(LLM_TENSOR_ATTN_K, "weight", il).str();
+            for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+                if (!std::regex_search(name, std::regex(o->pattern))) {
+                    continue;
+                }
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(o->buft);
+                if (dev != nullptr && dev != pimpl->dev_layer[il].dev) {
+                    LLAMA_LOG_DEBUG("load_tensors: layer %3d device overridden to %s (KV cache follows attention weights)\n",
+                            il, ggml_backend_dev_name(dev));
+                    pimpl->dev_layer[il].dev = dev;
+                }
+                break;
+            }
+        }
+    }
+
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
