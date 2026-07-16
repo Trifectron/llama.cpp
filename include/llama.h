@@ -392,6 +392,12 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // [EXPERIMENTAL] bound the transformer layer loop to [il_start, il_end) instead of the
+        // full model, for split-inference prototypes that hand off a hidden state at a layer
+        // boundary between separate head/tail contexts. il_end < 0 means "all layers" (default).
+        int32_t il_start;
+        int32_t il_end;
     };
 
     struct llama_model_tensor_override {

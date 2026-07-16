@@ -102,6 +102,14 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
 
+    // [EXPERIMENTAL] split-inference: bound the layer loop to [il_start, il_end) so this graph can
+    // act as a "head" (il_end < n_layer, hands off a hidden state instead of computing lm_head) or
+    // a "tail" (il_start > 0, consumes a hidden state via the existing ubatch.embd input path used
+    // by build_inp_embd() instead of a token lookup). Defaults (0, n_layer) reproduce the unsplit
+    // graph exactly.
+    const int il_start = cparams.il_start;
+    const int il_end   = cparams.il_end;
+
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
@@ -123,7 +131,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = il_start; il < il_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -171,7 +179,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == il_end - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -228,19 +236,27 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     }
     cur = inpL;
 
-    cur = build_norm(cur,
-            model.output_norm, NULL,
-            LLM_NORM_RMS, -1);
+    if (il_end < n_layer) {
+        // "head" context: hand off the boundary hidden state instead of computing norm/lm_head.
+        // Consumed the same way as MTP/EAGLE3's next-token hidden state (res->t_h_nextn), via
+        // llama_set/get_embeddings_nextn().
+        ggml_set_output(cur);
+        res->t_h_nextn = cur;
+    } else {
+        cur = build_norm(cur,
+                model.output_norm, NULL,
+                LLM_NORM_RMS, -1);
 
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
 
-    if constexpr (!embed) {
-        // lm_head
-        cur = build_lora_mm(model.output, cur, model.output_s);
+        if constexpr (!embed) {
+            // lm_head
+            cur = build_lora_mm(model.output, cur, model.output_s);
 
-        cb(cur, "result_output", -1);
-        res->t_logits = cur;
+            cb(cur, "result_output", -1);
+            res->t_logits = cur;
+        }
     }
 
     ggml_build_forward_expand(gf, cur);
