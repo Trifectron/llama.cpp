@@ -195,6 +195,13 @@ grpc::Status cluster_node_service::GetDownloadStatus(grpc::ServerContext *, cons
     return grpc::Status::OK;
 }
 
+grpc::Status cluster_node_service::EndSession(grpc::ServerContext *, const llama_cluster::EndSessionRequest * request,
+                                               llama_cluster::EndSessionResponse * response) {
+    end_session(request->request_id());
+    response->set_ok(true);
+    return grpc::Status::OK;
+}
+
 void cluster_node_service::register_local_runner(const std::string & request_id,
                                                    std::unique_ptr<cluster_layer_runner> runner,
                                                    const std::string & next_node_endpoint) {
@@ -206,8 +213,8 @@ void cluster_node_service::register_local_runner(const std::string & request_id,
     requests_[request_id]   = req;
 }
 
-bool cluster_node_service::wait_for_tail_result(const std::string & request_id, int timeout_ms,
-                                                  cluster_tail_result & out, std::string & out_error) {
+bool cluster_node_service::wait_for_next_token(const std::string & request_id, int timeout_ms,
+                                                 cluster_tail_result & out, std::string & out_error) {
     std::shared_ptr<pending_request> req;
     {
         std::lock_guard<std::mutex> lock(requests_mtx_);
@@ -223,15 +230,15 @@ bool cluster_node_service::wait_for_tail_result(const std::string & request_id, 
     const bool signaled = req->result_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
                                                     [&] { return req->done; });
 
-    {
-        std::lock_guard<std::mutex> cleanup_lock(requests_mtx_);
-        requests_.erase(request_id);
-    }
-
     if (!signaled) {
         out_error = "timed out waiting for tail result";
         return false;
     }
+
+    // reset for the next generation step - the runner (and its KV cache) stays registered under
+    // request_id until end_session() explicitly tears it down, not after every single token.
+    req->done = false;
+
     if (!req->ok) {
         out_error = req->error;
         return false;
@@ -239,6 +246,11 @@ bool cluster_node_service::wait_for_tail_result(const std::string & request_id, 
 
     out = req->tail_result;
     return true;
+}
+
+void cluster_node_service::end_session(const std::string & request_id) {
+    std::lock_guard<std::mutex> lock(requests_mtx_);
+    requests_.erase(request_id); // no-op if already gone - not an error for a cleanup call
 }
 
 void cluster_node_service::handle_hidden_state(const std::shared_ptr<pending_request> & req, const cluster_hidden_state & in) {
@@ -349,6 +361,20 @@ bool cluster_grpc_call_assign_layers(const std::string & endpoint, const llama_c
     auto stub = llama_cluster::ClusterNode::NewStub(make_channel(endpoint));
     grpc::ClientContext context;
     const grpc::Status status = stub->AssignLayers(&context, request, &response);
+    if (!status.ok()) {
+        out_error = status.error_message();
+        return false;
+    }
+    return true;
+}
+
+bool cluster_grpc_call_end_session(const std::string & endpoint, const std::string & request_id, std::string & out_error) {
+    auto stub = llama_cluster::ClusterNode::NewStub(make_channel(endpoint));
+    llama_cluster::EndSessionRequest request;
+    request.set_request_id(request_id);
+    llama_cluster::EndSessionResponse response;
+    grpc::ClientContext context;
+    const grpc::Status status = stub->EndSession(&context, request, &response);
     if (!status.ok()) {
         out_error = status.error_message();
         return false;

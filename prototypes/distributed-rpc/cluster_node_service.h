@@ -31,6 +31,8 @@ public:
                                 llama_cluster::DownloadModelResponse * response) override;
     grpc::Status GetDownloadStatus(grpc::ServerContext * context, const llama_cluster::GetDownloadStatusRequest * request,
                                     llama_cluster::GetDownloadStatusResponse * response) override;
+    grpc::Status EndSession(grpc::ServerContext * context, const llama_cluster::EndSessionRequest * request,
+                             llama_cluster::EndSessionResponse * response) override;
 
     // Path to the `llama` binary (its `download` subcommand, app/download.cpp) - must be set once
     // at startup, before any DownloadModel call, mirroring how cluster-ui.cpp resolves this same
@@ -47,11 +49,18 @@ public:
     void register_local_runner(const std::string & request_id, std::unique_ptr<cluster_layer_runner> runner,
                                 const std::string & next_node_endpoint);
 
-    // Blocks up to timeout_ms for PassOff to complete the tail runner registered under
-    // request_id (whether that runner was registered via a remote AssignLayers or via
-    // register_local_runner()). Used by the origin's launch handler to get the final answer.
-    bool wait_for_tail_result(const std::string & request_id, int timeout_ms,
-                               cluster_tail_result & out, std::string & out_error);
+    // Blocks up to timeout_ms for PassOff to deliver the next sampled token for the tail runner
+    // registered under request_id (whether that runner was registered via a remote AssignLayers
+    // or via register_local_runner()). Unlike a one-shot wait, this does NOT tear the session
+    // down afterward - it resets the pending_request so the same runner (and its KV cache) can be
+    // waited on again for the next generation step. Call end_session() when generation is done.
+    bool wait_for_next_token(const std::string & request_id, int timeout_ms,
+                              cluster_tail_result & out, std::string & out_error);
+
+    // Tears down the session registered under request_id, freeing its cluster_layer_runner (and
+    // therefore its llama_context/KV cache). No-op if request_id is unknown (session already
+    // ended, or never existed).
+    void end_session(const std::string & request_id);
 
 private:
     struct pending_request {
@@ -105,3 +114,5 @@ bool cluster_grpc_call_download_model(const std::string & endpoint, const llama_
 
 bool cluster_grpc_call_get_download_status(const std::string & endpoint, const llama_cluster::GetDownloadStatusRequest & request,
                                             llama_cluster::GetDownloadStatusResponse & response, std::string & out_error);
+
+bool cluster_grpc_call_end_session(const std::string & endpoint, const std::string & request_id, std::string & out_error);

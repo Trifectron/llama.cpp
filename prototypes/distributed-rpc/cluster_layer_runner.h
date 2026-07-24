@@ -58,6 +58,13 @@ public:
     // narrowly head-shaped, matching split-tap's own head/tail split.
     bool run_head(const std::string & prompt, cluster_hidden_state & out, std::string & out_error);
 
+    // Non-prompt continuation of a head runner (il_start == 0): feeds a single already-known
+    // token (the previous step's sampled token) at the given sequence position, decodes it, and
+    // returns the boundary hidden state for that one position. Used for every generation step
+    // after the initial run_head() prefill, so the head's llama_context KV cache just grows by
+    // one position per call instead of being rebuilt from the prompt each time.
+    bool run_head_next(llama_token tok, int32_t pos, cluster_hidden_state & out, std::string & out_error);
+
     // Non-head, non-tail (0 < il_start, il_end < n_layer): feeds an incoming hidden state as this
     // context's layer-0 input, decodes [il_start, il_end), returns the new boundary hidden state.
     bool run_trunk(const cluster_hidden_state & in, cluster_hidden_state & out, std::string & out_error);

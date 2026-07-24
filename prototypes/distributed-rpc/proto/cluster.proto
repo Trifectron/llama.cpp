@@ -46,6 +46,11 @@ service ClusterNode {
   // GetDownloadStatus polls it.
   rpc DownloadModel(DownloadModelRequest) returns (DownloadModelResponse);
   rpc GetDownloadStatus(GetDownloadStatusRequest) returns (GetDownloadStatusResponse);
+
+  // Origin -> node: generation loop for request_id has ended (EOG, n_predict reached, or an
+  // error broke the loop) - free this node's cluster_layer_runner (llama_context/KV cache) for
+  // it. No-op if request_id is unknown here.
+  rpc EndSession(EndSessionRequest) returns (EndSessionResponse);
 }
 
 message NodeCapabilities {
@@ -163,4 +168,12 @@ message GetDownloadStatusResponse {
   string        model_path  = 2; // populated once state == DOWNLOAD_STATE_DONE
   string        error       = 3; // populated once state == DOWNLOAD_STATE_FAILED
   string        output_tail = 4; // trailing slice of subprocess output, for progress visibility
+}
+
+message EndSessionRequest {
+  string request_id = 1;
+}
+
+message EndSessionResponse {
+  bool ok = 1;
 }

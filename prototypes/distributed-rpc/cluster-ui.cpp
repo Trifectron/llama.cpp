@@ -232,6 +232,14 @@ static std::mutex                                    g_runs_mtx;
 static std::map<std::string, std::shared_ptr<run_state>> g_runs;
 static int                                            g_next_run_id = 1;
 
+// Origin's own head runner (cluster_layer_runner bounded to [0, head_end)), keyed by request_id -
+// kept alive across multiple /api/launch-grpc round-trips for the same request instead of being
+// destroyed when the HTTP handler returns, so its KV cache carries over between generated tokens
+// (see PROGRESS.md step 3). Mirrors g_cluster_node's own request_id-keyed session map, just for
+// the head segment, which never goes through the gRPC service.
+static std::mutex                                                   g_head_runners_mtx;
+static std::map<std::string, std::unique_ptr<cluster_layer_runner>> g_head_runners;
+
 // ---------------------------------------------------------------------------------------------
 // Embedded RPC server (the "server" half of this binary's dual role) - a direct port of
 // tools/rpc/rpc-server.cpp's device-selection logic, calling the exact same underlying
@@ -377,7 +385,7 @@ static bool start_rpc_serve_background() {
 
 // Global service instances - the gRPC server holds non-owning pointers to these (standard
 // grpc::ServerBuilder::RegisterService() usage), and the /api/launch-grpc handler drives
-// cluster_node_service directly (register_local_runner()/wait_for_tail_result()) for the
+// cluster_node_service directly (register_local_runner()/wait_for_next_token()) for the
 // origin's own head/tail segments, so both need process-lifetime storage.
 static coordinator_service   g_coordinator;
 static cluster_node_service  g_cluster_node;
@@ -677,6 +685,20 @@ int main(int argc, char ** argv) {
         const std::string model_path = body.value("model_path", "");
         const std::string prompt     = body.value("prompt", "");
 
+        // Same bound-checked read as /api/launch's n_predict (see its comment) - reused here
+        // now that this handler actually loops instead of producing a single token.
+        int64_t n_predict_wide = 64;
+        try {
+            n_predict_wide = body.value("n_predict", (int64_t) 64);
+        } catch (const json::exception &) {
+        }
+        if (n_predict_wide < 1 || n_predict_wide > 65536) {
+            res.status = 400;
+            res.set_content(json{{"error", "n_predict must be between 1 and 65536"}}.dump(), "application/json");
+            return;
+        }
+        const int n_predict = (int) n_predict_wide;
+
         struct stat st;
         if (model_path.empty() || stat(model_path.c_str(), &st) != 0) {
             res.status = 400;
@@ -793,44 +815,117 @@ int main(int argc, char ** argv) {
         }
         g_cluster_node.register_local_runner(request_id, std::move(tail_runner), /*next_node_endpoint=*/"");
 
-        // 3. Run this node's own head locally (never a self-directed gRPC hop).
-        cluster_layer_runner head_runner;
+        // 3. Run this node's own head locally (never a self-directed gRPC hop). Kept in
+        //    g_head_runners under request_id (rather than as a stack local) so its KV cache
+        //    survives past this handler call - see PROGRESS.md step 3.
+        auto head_runner = std::make_unique<cluster_layer_runner>();
         std::string head_error;
-        if (!head_runner.prepare(model_path, 0, head_end, /*n_ctx=*/4096, head_error)) {
+        if (!head_runner->prepare(model_path, 0, head_end, /*n_ctx=*/4096, head_error)) {
             res.status = 500;
             res.set_content(json{{"error", "failed to prepare local head: " + head_error}}.dump(), "application/json");
             return;
         }
         cluster_hidden_state hidden;
-        if (!head_runner.run_head(prompt, hidden, head_error)) {
+        if (!head_runner->run_head(prompt, hidden, head_error)) {
             res.status = 500;
             res.set_content(json{{"error", "local head failed: " + head_error}}.dump(), "application/json");
             return;
         }
+        cluster_layer_runner * head_runner_ptr = head_runner.get();
+        {
+            std::lock_guard<std::mutex> lock(g_head_runners_mtx);
+            g_head_runners[request_id] = std::move(head_runner);
+        }
+
+        // Tears down every trunk node's session for this request_id (their AssignLayers-
+        // registered runner/KV-cache never gets freed otherwise - see PROGRESS.md step 5).
+        // Best-effort: a trunk node that's already gone is nothing to retry, so errors are
+        // swallowed rather than failing the whole response over cleanup.
+        auto end_trunk_sessions = [&trunk, &request_id]() {
+            for (const auto & hop : trunk) {
+                std::string end_session_error;
+                cluster_grpc_call_end_session(hop.endpoint, request_id, end_session_error);
+            }
+        };
 
         // 4. Hand off to the first trunk node (or straight back to this node's own tail if no
         //    trunk nodes were selected - a degenerate but valid all-local U "split").
         const std::string first_hop = trunk.empty() ? self_endpoint : trunk.front().endpoint;
         std::string pass_off_error;
         if (!cluster_grpc_send_pass_off(first_hop, request_id, hidden, pass_off_error)) {
+            g_cluster_node.end_session(request_id);
+            end_trunk_sessions();
+            {
+                std::lock_guard<std::mutex> lock(g_head_runners_mtx);
+                g_head_runners.erase(request_id);
+            }
             res.status = 502;
             res.set_content(json{{"error", "initial PassOff to " + first_hop + " failed: " + pass_off_error}}.dump(), "application/json");
             return;
         }
 
-        // 5. Wait for the tail (this node's own PassOff handler) to complete the request.
-        cluster_tail_result result;
-        std::string wait_error;
-        if (!g_cluster_node.wait_for_tail_result(request_id, /*timeout_ms=*/30000, result, wait_error)) {
-            res.status = 504;
-            res.set_content(json{{"error", "pipeline did not complete: " + wait_error}}.dump(), "application/json");
+        // 5. Generation loop: repeatedly wait for the tail's sampled token, feed it back into
+        //    the head as the next position, and PassOff the resulting hidden state through the
+        //    same trunk chain again - until EOG or n_predict tokens have been produced. Every
+        //    node's llama_context (head here, trunk/tail via g_cluster_node) just grows its own
+        //    KV cache by one position per iteration; no cache-sharding code needed, only this
+        //    loop (see PROGRESS.md step 4).
+        std::vector<cluster_tail_result> generated;
+        std::string loop_error;
+        bool loop_ok = true;
+        int32_t next_pos = hidden.n_tokens; // prompt occupied positions [0, hidden.n_tokens)
+
+        for (int step = 0; step < n_predict; ++step) {
+            cluster_tail_result result;
+            std::string wait_error;
+            if (!g_cluster_node.wait_for_next_token(request_id, /*timeout_ms=*/30000, result, wait_error)) {
+                loop_ok   = false;
+                loop_error = "pipeline did not complete: " + wait_error;
+                break;
+            }
+            generated.push_back(result);
+            if (result.is_eog || step + 1 >= n_predict) {
+                break;
+            }
+
+            cluster_hidden_state next_hidden;
+            std::string next_head_error;
+            if (!head_runner_ptr->run_head_next(result.token, next_pos, next_hidden, next_head_error)) {
+                loop_ok    = false;
+                loop_error = "local head continuation failed: " + next_head_error;
+                break;
+            }
+            ++next_pos;
+
+            if (!cluster_grpc_send_pass_off(first_hop, request_id, next_hidden, pass_off_error)) {
+                loop_ok    = false;
+                loop_error = "PassOff to " + first_hop + " failed: " + pass_off_error;
+                break;
+            }
+        }
+
+        g_cluster_node.end_session(request_id);
+        end_trunk_sessions();
+        {
+            std::lock_guard<std::mutex> lock(g_head_runners_mtx);
+            g_head_runners.erase(request_id);
+        }
+
+        if (!loop_ok) {
+            res.status = 502;
+            res.set_content(json{{"error", loop_error}}.dump(), "application/json");
             return;
         }
 
+        json tokens_json = json::array();
+        std::string text;
+        for (const auto & r : generated) {
+            tokens_json.push_back({{"token", r.token}, {"piece", r.piece}, {"is_eog", r.is_eog}});
+            text += r.piece;
+        }
         res.set_content(json{
-            {"token",   result.token},
-            {"piece",   result.piece},
-            {"is_eog",  result.is_eog},
+            {"text",   text},
+            {"tokens", tokens_json},
         }.dump(), "application/json");
     });
 

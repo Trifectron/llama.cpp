@@ -124,6 +124,41 @@ bool cluster_layer_runner::run_head(const std::string & prompt, cluster_hidden_s
     return true;
 }
 
+bool cluster_layer_runner::run_head_next(llama_token tok, int32_t pos, cluster_hidden_state & out, std::string & out_error) {
+    if (!is_head()) {
+        out_error = "run_head_next() called on a non-head runner";
+        return false;
+    }
+
+    struct llama_batch batch = llama_batch_init(1, 0, 1);
+    batch.n_tokens     = 1;
+    batch.token[0]     = tok;
+    batch.pos[0]       = pos;
+    batch.n_seq_id[0]  = 1;
+    batch.seq_id[0][0] = 0;
+    batch.logits[0]    = 1;
+
+    const int rc = llama_decode(ctx_, batch);
+    llama_batch_free(batch);
+    if (rc != 0) {
+        out_error = "head llama_decode failed (rc=" + std::to_string(rc) + ")";
+        return false;
+    }
+
+    const float * h = llama_get_embeddings_nextn(ctx_);
+    if (h == nullptr) {
+        out_error = "head produced no hidden state";
+        return false;
+    }
+
+    out.n_tokens = 1;
+    out.n_embd   = n_embd_;
+    out.data.assign(h, h + (size_t) n_embd_);
+    out.positions.assign(1, pos);
+
+    return true;
+}
+
 // Shared by run_trunk()/run_tail(): builds an embd batch from an incoming hidden state using its
 // own recorded positions (RoPE must see the true sequence positions, not a restart from 0), and
 // decodes. Returns the batch's token count so callers can index into logits/embeddings.

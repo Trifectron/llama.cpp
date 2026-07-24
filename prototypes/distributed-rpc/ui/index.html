@@ -590,6 +590,9 @@ async function launchGrpc() {
   $("grpcOutput").style.display = "block";
   $("grpcOutput").textContent = "";
 
+  const nPredictRaw = parseInt($("nPredict").value, 10);
+  const nPredict = Number.isFinite(nPredictRaw) ? Math.min(4096, Math.max(1, nPredictRaw)) : 32;
+
   try {
     const res = await fetch("/api/launch-grpc", {
       method: "POST",
@@ -597,6 +600,7 @@ async function launchGrpc() {
       body: JSON.stringify({
         model_path: model.path,
         prompt: $("prompt").value,
+        n_predict: nPredict,
         head_layers: plan.head_layers,
         tail_layers: plan.tail_layers,
         trunk: plan.trunk,
@@ -605,7 +609,7 @@ async function launchGrpc() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
 
-    $("grpcOutput").textContent = `token=${data.token}  piece=${JSON.stringify(data.piece)}  is_eog=${data.is_eog}`;
+    $("grpcOutput").textContent = data.text;
     $("grpcStatus").textContent = "done";
     $("grpcStatus").className = "status ok";
   } catch (e) {
