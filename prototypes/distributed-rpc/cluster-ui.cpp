@@ -73,6 +73,7 @@ struct gguf_meta {
     std::string arch;
     uint32_t    n_layers   = 0;
     uint64_t    size_bytes = 0;
+    bool        shares_kv  = false; // model reuses KV across layers (<arch>.attention.shared_kv_layers)
 };
 
 static bool gguf_read_string(FILE * f, std::string & out) {
@@ -144,6 +145,17 @@ static bool read_gguf_meta(const std::string & path, gguf_meta & out) {
     std::map<std::string, std::string> strs;
     std::map<std::string, uint64_t>    ints;
 
+    // Read the whole KV section - no early break. Config keys aren't reliably ordered before
+    // the tokenizer arrays (gemma3n emits block_count at kv[11] / shared_kv_layers at kv[23]
+    // before the tokenizer; a llama2c-converted model puts block_count *after* them), so any
+    // position-based stop either misses a key or fails to parse some model. Skipping the huge
+    // tokenizer arrays costs a bounded burst of buffered freads (~tens of ms) - negligible for a
+    // one-time model-inspection call, and correctness beats the micro-optimization here.
+    // note: shared_kv_layers is detected by key presence, not value - gemma3n stores it as a
+    // float32 (10.0), so an int-typed lookup would miss it. Only its existence matters here.
+    bool saw_shared_kv = false;
+    const std::string shared_kv_suffix = ".attention.shared_kv_layers";
+
     for (uint64_t i = 0; ok && i < kv_count; ++i) {
         std::string key;
         ok = ok && gguf_read_string(f, key);
@@ -151,6 +163,11 @@ static bool read_gguf_meta(const std::string & path, gguf_meta & out) {
         ok = ok && fread(&vtype, 4, 1, f) == 1;
         if (!ok) {
             break;
+        }
+
+        if (key.size() >= shared_kv_suffix.size() &&
+            key.compare(key.size() - shared_kv_suffix.size(), shared_kv_suffix.size(), shared_kv_suffix) == 0) {
+            saw_shared_kv = true;
         }
 
         std::string sval;
@@ -165,23 +182,28 @@ static bool read_gguf_meta(const std::string & path, gguf_meta & out) {
         } else if (vtype <= 5 || vtype == 10 || vtype == 11) {
             ints[key] = ival;
         }
-
-        auto arch_it = strs.find("general.architecture");
-        if (arch_it != strs.end()) {
-            auto layers_it = ints.find(arch_it->second + ".block_count");
-            if (layers_it != ints.end()) {
-                out.arch     = arch_it->second;
-                out.n_layers = (uint32_t) layers_it->second;
-                fclose(f);
-                struct stat st;
-                out.size_bytes = (stat(path.c_str(), &st) == 0) ? (uint64_t) st.st_size : 0;
-                return true;
-            }
-        }
     }
 
     fclose(f);
-    return false;
+
+    if (!ok) {
+        return false;
+    }
+    auto arch_it = strs.find("general.architecture");
+    if (arch_it == strs.end()) {
+        return false;
+    }
+    auto layers_it = ints.find(arch_it->second + ".block_count");
+    if (layers_it == ints.end()) {
+        return false;
+    }
+
+    out.arch      = arch_it->second;
+    out.n_layers  = (uint32_t) layers_it->second;
+    out.shares_kv = saw_shared_kv;
+    struct stat st;
+    out.size_bytes = (stat(path.c_str(), &st) == 0) ? (uint64_t) st.st_size : 0;
+    return true;
 }
 
 // Recursively scans a directory tree for *.gguf files, depth-bounded (defensive against
@@ -758,6 +780,34 @@ int main(int argc, char ** argv) {
                 res.set_content(json{{"error", "trunk layer ranges must contiguously cover [head_end, tail_start) with no gaps or overlaps"}}.dump(), "application/json");
                 return;
             }
+        }
+
+        // Guard: a model that reuses KV across layers (e.g. Gemma 3n, via
+        // attention.shared_kv_layers) has late layers that attend into an *earlier* layer's KV.
+        // Splitting those layers onto different machines makes a borrower need KV that lives on
+        // another node - which no path currently handles:
+        //   - U-shape gRPC (here): independent per-node contexts can't resolve it at all.
+        //   - plain --split-mode layer --distributed: EMPIRICALLY CRASHES ("invalid data ptr" on
+        //     the borrower's rpc-server) - verified with gemma-3n-E2B split across two rpc-servers;
+        //     the ggml scheduler does NOT copy the persistent cross-device KV tensor. (Single-node
+        //     RPC, i.e. all layers on one machine, works fine.)
+        // So refuse any cross-node (trunk non-empty) split of such a model here, at the single
+        // point the split is planned, and steer the user to running it whole on one machine.
+        // ponytail: coarse - refuses whenever any trunk node exists, even a split that happens to
+        //   keep all KV-sharing layers co-located. Fine: for these models every borrower needs an
+        //   earlier layer's KV, so any off-origin layer is at risk. Per-layer placement isn't
+        //   worth it while the underlying cross-device-KV support doesn't exist upstream anyway.
+        if (meta.shares_kv && !trunk.empty()) {
+            res.status = 400;
+            res.set_content(json{{"error",
+                "model '" + meta.arch + "' shares KV across layers (attention.shared_kv_layers); "
+                "it cannot be split across machines - a later layer attends into an earlier "
+                "layer's KV, which no current path transfers across nodes (the plain "
+                "--split-mode layer --distributed path crashes on this too). Run the whole model "
+                "on one machine: locally (empty trunk here), or all layers on a single "
+                "ggml-rpc-server."}}.dump(),
+                "application/json");
+            return;
         }
 
         static std::mutex     request_id_mtx;
